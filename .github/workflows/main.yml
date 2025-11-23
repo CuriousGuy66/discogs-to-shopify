@@ -1,36 +1,65 @@
-name: Run Discogs to Shopify
+name: Discogs to Shopify Export
 
 on:
+  # Run manually from the Actions tab
   workflow_dispatch:
+
+  # Or automatically whenever something in the input folder changes
   push:
     paths:
       - "input/**"
 
 jobs:
-  run-pipeline:
+  build-and-export:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"
+      - name: Show working directory and list files (debug)
+        run: |
+          echo "Working directory:"
+          pwd
+          echo "Repo contents:"
+          ls -R .
 
-    - name: Install dependencies
-      run: pip install -r requirements.txt
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Run Discogs → Shopify script
-      env:
-        DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
-      run: |
-        mkdir -p output
-        python discogs_to_shopify.py input/input.xlsx output/output.csv --token "$DISCOGS_TOKEN"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # Fallback: install the libraries this script needs
+            pip install pandas requests python-slugify openpyxl
+          fi
 
-    - name: Upload Shopify CSV as artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: shopify-output
-        path: output/output.csv
+      - name: Run Discogs → Shopify script
+        env:
+          DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
+        run: |
+          mkdir -p output
+          python discogs_to_shopify.py \
+            input/input.xlsx \
+            output/output.csv \
+            --token "$DISCOGS_TOKEN" \
+            --log-level INFO
+
+      - name: List output files (debug)
+        run: |
+          echo "Output directory contents:"
+          ls -R .
+
+      - name: Upload CSV artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-output
+          path: |
+            output/output.csv
+            output/output_unmatched.csv
+
