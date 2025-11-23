@@ -1,3 +1,15 @@
+"""
+VERSION HISTORY
+v1.0 – Initial build (Discogs → Shopify)
+v1.1 – Added Reference Price
+v1.2 – Added signage logic
+v1.3 – Added Religious & Bluegrass signage
+v1.4 – Added Country, Metal, Reggae, etc.
+v1.5 – Added Shopify metafield for signage
+v1.6 – Updated field names to Shopify template
+v1.7 – Updated Center label photo mapping
+...
+"""
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -14,10 +26,10 @@ Standalone script to:
    - Discogs link
    - Discogs cover as first image
    - Optional Center Label Photo as second image (via extra row)
-   - Your Shopify preferences (price rounding, metafields, etc.)
+   - Metafields for album condition, shop signage, etc.
 
 REQUIREMENTS:
-    pip install requests pandas python-slugify
+    pip install requests pandas python-slugify openpyxl
 
 USAGE:
     python discogs_to_shopify.py input.xlsx output.csv --token YOUR_DISCOGS_TOKEN
@@ -34,6 +46,7 @@ import logging
 import math
 import sys
 import time
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -169,7 +182,7 @@ def simple_shop_signage(genre: str, styles: list[str] = None) -> str:
     if "gospel" in g or styles_contains("gospel"):
         return "Gospel"
 
-    # 4. Religious (only if not Christmas or Gospel, but we already returned above if those hit)
+    # 4. Religious (only if not Christmas or Gospel; those already returned above)
     if "religious" in g or styles_contains("religious"):
         return "Religious"
 
@@ -250,18 +263,30 @@ def simple_shop_signage(genre: str, styles: list[str] = None) -> str:
     return genre or ""
 
 
-
 def round_price_to_quarter(price_str: str) -> float:
-    """Round price to nearest quarter and enforce minimum price."""
-    try:
-        raw = float(price_str)
-    except (TypeError, ValueError):
+    """
+    Round price to nearest quarter and enforce minimum price.
+    Handles values like:
+      "5", "5.00", "$5.00", "  5.25 USD", "5,000.00"
+    """
+    if not price_str:
         raw = MIN_PRICE
+    else:
+        s = str(price_str).strip()
+        # Remove everything except digits, dot, minus
+        s = re.sub(r"[^0-9.\-]", "", s)
+        if s in ("", ".", "-", "-.", ".-"):
+            raw = MIN_PRICE
+        else:
+            try:
+                raw = float(s)
+            except ValueError:
+                raw = MIN_PRICE
+
     # Round to nearest 0.25
     rounded = round(raw / PRICE_STEP) * PRICE_STEP
     if rounded < MIN_PRICE:
         rounded = MIN_PRICE
-    # Avoid float representation quirks like 12.499999
     return float(f"{rounded:.2f}")
 
 
@@ -616,44 +641,68 @@ def make_shopify_rows_for_record(
 
     body_html = "\n".join(body_lines)
 
-    # Shopify base row
+    # Shopify base row (mapped to Shopify product_template_csv_unit_price.csv fields)
     row: Dict[str, Any] = {
-        "Handle": handle,
+        # Core product fields
         "Title": full_title,
-        "Body (HTML)": body_html,
+        "URL handle": handle,
+        "Description": body_html,
         "Vendor": artist_display,
-        "Product Category": SHOPIFY_PRODUCT_CATEGORY,
-        "Product Type": SHOPIFY_PRODUCT_TYPE,
+        "Product category": SHOPIFY_PRODUCT_CATEGORY,
+        "Type": SHOPIFY_PRODUCT_TYPE,
         "Tags": tags,
-        "Published": SHOPIFY_PUBLISHED,
-        "Option1 Name": SHOPIFY_OPTION1_NAME,
-        "Option1 Value": SHOPIFY_OPTION1_VALUE,
-        "Variant SKU": discogs_release_id or "",
-        "Variant Grams": grams if grams is not None else "",
-        "Variant Inventory Tracker": "shopify",
-        "Variant Inventory Qty": 1,
-        "Variant Inventory Policy": "deny",
-        "Variant Fulfillment Service": SHOPIFY_VARIANT_FULFILLMENT_SERVICE,
-        "Variant Price": price_str_out,
-        "Variant Compare At Price": "",
-        "Variant Requires Shipping": SHOPIFY_VARIANT_REQUIRES_SHIPPING,
-        "Variant Taxable": SHOPIFY_VARIANT_TAXABLE,
-        "Variant Barcode": "",  # you can map Discogs barcodes if needed
-
-        "Image Src": primary_image_url,
-        "Image Position": 1,
-        "Image Alt Text": full_title,
-
-        "SEO Title": seo_title,
-        "SEO Description": seo_description,
+        "Published on online store": SHOPIFY_PUBLISHED,
         "Status": SHOPIFY_PRODUCT_STATUS,
 
+        # Variant options (single variant)
+        "Option1 name": SHOPIFY_OPTION1_NAME,
+        "Option1 value": SHOPIFY_OPTION1_VALUE,
+        "Option2 name": "",
+        "Option2 value": "",
+        "Option3 name": "",
+        "Option3 value": "",
+
+        # Pricing
+        "Price": price_str_out,
+        "Compare-at price": "",
+        "Cost per item": "",
+        "Charge tax": SHOPIFY_VARIANT_TAXABLE,  # "TRUE" / "FALSE"
+        "Tax code": "",
+        "Unit price total measure": "",
+        "Unit price total measure unit": "",
+        "Unit price base measure": "",
+        "Unit price base measure unit": "",
+
+        # Inventory
+        "SKU": discogs_release_id or "",
+        "Barcode": "",  # you can map Discogs barcodes if needed
+        "Inventory tracker": "shopify",
+        "Inventory quantity": 1,
+        "Continue selling when out of stock": "FALSE",  # corresponds to "deny"
+
+        # Weight & shipping
+        "Weight value (grams)": grams if grams is not None else "",
+        "Weight unit for display": "g" if grams is not None else "",
+        "Requires shipping": SHOPIFY_VARIANT_REQUIRES_SHIPPING,
+        "Fulfillment service": SHOPIFY_VARIANT_FULFILLMENT_SERVICE,
+
+        # Images (first image = Discogs cover)
+        "Product image URL": primary_image_url,
+        "Image position": 1,
+        "Image alt text": full_title,
+        "Variant image URL": "",  # not used for single-variant
+        "Gift card": "FALSE",
+
+        # SEO
+        "SEO title": seo_title,
+        "SEO description": seo_description,
+
         # Extra business fields (Shopify ignores unknown columns)
-        "Shop Signage": shop_signage,
         # Product metafields based on your mapping:
         # Album_Cover_Condition = Sleeve Condition; Album_Condition = 'Used'
         "Metafield: custom.album_cover_condition [single_line_text_field]": sleeve_cond,
         "Metafield: custom.album_condition [single_line_text_field]": "Used",
+        "Metafield: custom.shop_signage [single_line_text_field]": shop_signage,
         # Optional custom variant weight in pounds (even though Shopify uses grams)
         "Variant Weight (lb)": pounds if pounds is not None else "",
     }
@@ -663,10 +712,13 @@ def make_shopify_rows_for_record(
     # If we have a center label photo, create a second row with only image
     if center_label_photo:
         img_row = {k: "" for k in row.keys()}
-        img_row["Handle"] = handle
-        img_row["Image Src"] = center_label_photo
-        img_row["Image Position"] = 2
-        img_row["Image Alt Text"] = f"{full_title} - Center Label"
+        # Keep the same product identity
+        img_row["Title"] = full_title
+        img_row["URL handle"] = handle
+        # Second image
+        img_row["Product image URL"] = center_label_photo
+        img_row["Image position"] = 2
+        img_row["Image alt text"] = f"{full_title} - Center Label"
         rows.append(img_row)
 
     return rows
