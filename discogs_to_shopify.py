@@ -560,7 +560,7 @@ def make_shopify_rows_for_record(
     genre, styles = extract_genre_and_styles(release_details)
     format_desc = build_format_description(release_details)
     tracklist_html = build_tracklist_html(release_details)
-    shop_signage = simple_shop_signage(genre)
+    shop_signage = simple_shop_signage(genre, styles)
 
     discogs_release_id = release_details.get("id")
     discogs_url = f"https://www.discogs.com/release/{discogs_release_id}" if discogs_release_id else ""
