@@ -65,7 +65,7 @@ PRICE_STEP = 0.25  # round to nearest quarter
 # Column names expected in the input sheet (you can adjust these as needed)
 COL_ARTIST = "Artist"
 COL_TITLE = "Title"
-COL_PRICE = "Price"
+COL_PRICE = "Reference Price"
 COL_COUNTRY = "Country"
 COL_CATALOG = "Catalog"
 COL_CENTER_LABEL_PHOTO = "Center Label Photo"
