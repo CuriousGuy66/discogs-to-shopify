@@ -273,13 +273,39 @@ def extract_primary_image_url(release_search_or_details: Dict[str, Any]) -> str:
 
 def calculate_weight_grams_from_formats(release: Dict[str, Any]) -> Optional[int]:
     """
-    Placeholder: If Discogs ever includes weight info in formats, parse it.
-    For now, we can either:
-      - return None (no explicit weight)
-      - or estimate based on number of discs, but we’ll keep it simple.
+    Estimate package weight (grams) from Discogs 'formats' quantity.
+
+    Logic:
+      - Look at release["formats"] and sum 'qty' values (default 1 if missing).
+      - If total discs == 0 → assume 1.
+      - Weight:
+          1 disc  -> 300 g
+          2 discs -> 500 g
+          3 discs -> 700 g
+          4+ discs -> 300 g + 200 g for each extra disc
     """
-    # You can add smart estimation later; for now, return None.
-    return None
+    formats = release.get("formats") or []
+    total_discs = 0
+
+    for fmt in formats:
+        qty = fmt.get("qty")
+        try:
+            q = int(qty)
+        except (TypeError, ValueError):
+            q = 1
+        if q <= 0:
+            q = 1
+        total_discs += q
+
+    if total_discs <= 0:
+        total_discs = 1
+
+    if total_discs == 1:
+        grams = 300
+    else:
+        grams = 300 + 200 * (total_discs - 1)
+
+    return grams
 
 
 def grams_to_pounds(grams: Optional[int]) -> Optional[float]:
