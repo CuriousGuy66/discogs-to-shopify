@@ -1,0 +1,35 @@
+name: Run Discogs to Shopify
+
+on:
+  workflow_dispatch:   # lets you press "Run Workflow"
+  push:
+    paths:
+      - "input/**"     # whenever you upload a new input file
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+
+    - name: Run Discogs→Shopify pipeline
+      env:
+        DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
+      run: |
+        python discogs_to_shopify.py input/input.xlsx output/output.csv --token "$DISCOGS_TOKEN"
+
+    - name: Upload Shopify CSV as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: shopify-output
+        path: output/output.csv
