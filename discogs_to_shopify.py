@@ -85,6 +85,16 @@ COL_CENTER_LABEL_PHOTO = "Center label photo"
 COL_MEDIA_COND = "Media Condition"
 COL_SLEEVE_COND = "Sleeve Condition"
 
+DESCRIPTION_FOOTER_HTML = (
+    "<p>All albums are stored in heavy-duty protective sleeves to help preserve "
+    "their condition. The first image shown is a stock photo for reference.</p>"
+    "<p>Please note that every record we sell goes through a careful process "
+    "that includes inspection, research, detailed listing, and photography. "
+    "Our prices may not always be the lowest, but we take pride in accurately "
+    "representing each album and providing thorough information so you can "
+    "buy with confidence.</p>"
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -639,7 +649,12 @@ def make_shopify_rows_for_record(
         body_lines.append("<br>")
         body_lines.append(tracklist_html)
 
+    # Add footer text at the very bottom of the description
+    body_lines.append("<br>")
+    body_lines.append(DESCRIPTION_FOOTER_HTML)
+
     body_html = "\n".join(body_lines)
+
 
     # Shopify base row (mapped to Shopify product_template_csv_unit_price.csv fields)
     row: Dict[str, Any] = {
