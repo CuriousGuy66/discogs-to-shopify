@@ -108,30 +108,147 @@ def normalize_artist_the(artist: str) -> str:
     return s
 
 
-def simple_shop_signage(genre: str) -> str:
+def simple_shop_signage(genre: str, styles: list[str] = None) -> str:
     """
-    Simplify genre for shop signage.
-    Special rule: any genre that has 'stage' or 'sound' goes to 'Stage and Sound'.
+    Simplify genre + styles for shop signage.
+
+    Priority:
+      1. Stage and Sound (includes Soundtrack)
+      2. Christmas / Holiday / Xmas
+      3. Gospel
+      4. Religious
+      5. Bluegrass
+      6. Country
+      7. Metal
+      8. Reggae
+      9. Latin
+     10. Folk
+     11. Children's
+     12. Comedy
+     13. New Age
+     14. Spoken Word
+     15. Rock
+     16. Jazz
+     17. Blues
+     18. Soul/Funk
+     19. Classical
+     20. Electronic
+     21. Hip-Hop/Rap
+     22. Default: raw Discogs genre
     """
     g = (genre or "").lower()
-    if "stage" in g or "sound" in g:
+    styles = styles or []
+    styles_lower = [s.lower() for s in styles]
+
+    def styles_contains(sub: str) -> bool:
+        return any(sub in s for s in styles_lower)
+
+    # 1. Stage and Sound (also capture Soundtrack)
+    if (
+        "stage" in g
+        or "sound" in g
+        or "soundtrack" in g
+        or styles_contains("stage")
+        or styles_contains("sound")
+        or styles_contains("soundtrack")
+    ):
         return "Stage and Sound"
-    # Basic simplification; you can expand this mapping as needed
+
+    # 2. Christmas / Holiday / Xmas
+    if (
+        "christmas" in g
+        or "holiday" in g
+        or "xmas" in g
+        or styles_contains("christmas")
+        or styles_contains("holiday")
+        or styles_contains("xmas")
+    ):
+        return "Christmas"
+
+    # 3. Gospel
+    if "gospel" in g or styles_contains("gospel"):
+        return "Gospel"
+
+    # 4. Religious (only if not Christmas or Gospel, but we already returned above if those hit)
+    if "religious" in g or styles_contains("religious"):
+        return "Religious"
+
+    # 5. Bluegrass
+    if styles_contains("bluegrass"):
+        return "Bluegrass"
+
+    # 6. Country
+    if "country" in g or styles_contains("country"):
+        return "Country"
+
+    # 7. Metal
+    if "metal" in g or styles_contains("metal"):
+        return "Metal"
+
+    # 8. Reggae
+    if "reggae" in g or styles_contains("reggae"):
+        return "Reggae"
+
+    # 9. Latin
+    if "latin" in g or styles_contains("latin"):
+        return "Latin"
+
+    # 10. Folk
+    if "folk" in g or styles_contains("folk"):
+        return "Folk"
+
+    # 11. Children's
+    if (
+        "children" in g
+        or "kids" in g
+        or styles_contains("children")
+        or styles_contains("kids")
+    ):
+        return "Children's"
+
+    # 12. Comedy
+    if "comedy" in g or styles_contains("comedy"):
+        return "Comedy"
+
+    # 13. New Age
+    if "new age" in g or styles_contains("new age"):
+        return "New Age"
+
+    # 14. Spoken Word
+    if "spoken word" in g or styles_contains("spoken word"):
+        return "Spoken Word"
+
+    # 15. Rock
     if "rock" in g:
         return "Rock"
+
+    # 16. Jazz
     if "jazz" in g:
         return "Jazz"
+
+    # 17. Blues
     if "blues" in g:
         return "Blues"
+
+    # 18. Soul/Funk
     if "soul" in g or "funk" in g:
         return "Soul/Funk"
+
+    # 19. Classical
     if "classical" in g:
         return "Classical"
+
+    # 20. Electronic
     if "electronic" in g:
         return "Electronic"
+
+    # 21. Hip-Hop / Rap
     if "hip hop" in g or "rap" in g:
         return "Hip-Hop/Rap"
+
+    # 22. Fallback: raw genre from Discogs
     return genre or ""
+
 
 
 def round_price_to_quarter(price_str: str) -> float:
