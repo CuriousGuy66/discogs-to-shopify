@@ -68,7 +68,7 @@ COL_TITLE = "Title"
 COL_PRICE = "Reference Price"
 COL_COUNTRY = "Country"
 COL_CATALOG = "Catalog"
-COL_CENTER_LABEL_PHOTO = "Center Label Photo"
+COL_CENTER_LABEL_PHOTO = "Center label photo"
 COL_MEDIA_COND = "Media Condition"
 COL_SLEEVE_COND = "Sleeve Condition"
 
