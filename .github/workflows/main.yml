@@ -29,7 +29,7 @@ jobs:
         python discogs_to_shopify.py input/input.xlsx output/output.csv --token "$DISCOGS_TOKEN"
 
     - name: Upload Shopify CSV as artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: shopify-output
         path: output/output.csv
