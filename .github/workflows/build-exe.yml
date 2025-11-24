@@ -1,12 +1,7 @@
 name: Build Windows EXE
 
 on:
-  # Run manually from the Actions tab
   workflow_dispatch:
-
-  # Optional: auto-build when you push to main
-  # push:
-  #   branches: [ main ]
 
 jobs:
   build-exe:
@@ -24,20 +19,17 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if exist requirements.txt (
+          if (Test-Path "requirements.txt") {
             pip install -r requirements.txt
-          ) else (
+          } else {
             pip install pandas requests python-slugify openpyxl pyinstaller
-          )
+          }
 
       - name: Build EXE with PyInstaller
         run: |
-          pyinstaller --onefile ^
-            --name discogs-to-shopify-gui ^
+          pyinstaller --onefile `
+            --name discogs-to-shopify-gui `
             discogs_to_shopify_gui_v1_2_0.py
-
-      - name: List dist folder (debug)
-        run: dir dist
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
