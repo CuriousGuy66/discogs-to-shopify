@@ -23,9 +23,10 @@ jobs:
 
       - name: Build EXE with PyInstaller
         run: |
-          python -m PyInstaller --onefile `
-            --name discogs-to-shopify-gui `
-            discogs_to_shopify_gui_v1_2_0.py
+          python -m PyInstaller --onefile ^
+            --icon "unusual_finds_icon.ico" ^
+            --name discogs-to-shopify-gui ^
+            discogs_to_shopify_gui_v1_2_2.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
