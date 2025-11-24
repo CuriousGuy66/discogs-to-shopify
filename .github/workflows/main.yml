@@ -44,7 +44,7 @@ jobs:
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
         run: |
           mkdir -p output
-          python discogs_to_shopify.py \
+          python discogs_to_shopify_v1_1_1.py \
             input/input.xlsx \
             output/output.csv \
             --token "$DISCOGS_TOKEN" \
