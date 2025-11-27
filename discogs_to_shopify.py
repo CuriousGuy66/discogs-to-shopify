@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Optional, List
 
-from discogs_to_shopify_gui_v1_2_3 import (
+from discogs_to_shopify_gui import (
     parse_args,
     process_file,
     print_run_banner,
