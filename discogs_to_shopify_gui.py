@@ -1,107 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-discogs_to_shopify_gui_v1.2.3.py
+discogs_to_shopify_gui.py
 
-VERSION HISTORY
-===============================================================================
-v1.2.3 – 2025-11-27
-    - Integrated label_ocr module:
-        * Uses center label photo to OCR catalog number, year, label name, etc.
-        * Feeds label-derived catalog number into Discogs search when available.
-    - New misprint detection:
-        * Compares label OCR data vs Discogs:
-            - year
-            - catalog number
-            - first track title
-            - artist
-        * Adds two Shopify columns:
-            - Label_Misprint_Suspected (TRUE/FALSE)
-            - Label_Misprint_Reasons (semi-colon separated text).
-    - Unmatched CSV "Discogs_Query" column now shows the actual query string
-      built from label + spreadsheet data (via build_discogs_query_with_label).
-
-v1.2.2 – 2025-11-24
-    - Shopify CSV tweaks:
-        * Removed/disabled "Collection" column from output (kept in code
-          comment for potential future use).
-        * Renamed inventory policy column from
-            "Continue selling when out of stock"
-          to
-            "Out of stock inventory policy"
-          and changed value from "FALSE" to "deny".
-    - Added a determinate progress bar and status label in the GUI showing
-      "Processing X of Y" plus a rough ETA in seconds.
-    - Added simple settings persistence:
-        * Remembers last input file path.
-        * Remembers last dry-run limit.
-      Settings are stored in a JSON file next to the script/EXE.
-    - Preserved all prior logic (Discogs matching, unmatched CSV, pricing,
-      signage, center-label photo, metafields, etc.).
-
-v1.2.1 – 2025-11-24
-    - GUI checks for Discogs token in the environment variable DISCOGS_TOKEN.
-    - If DISCOGS_TOKEN is set, it auto-fills the token field.
-    - If DISCOGS_TOKEN is not set and the user enters a token in the GUI, the
-      script saves it to:
-          - The current process environment, and
-          - Windows user environment (via `setx DISCOGS_TOKEN <token>`) when
-            running on Windows, so it is available for future runs.
-
-v1.2.0 – 2025-11-23
-    - Added a full Tkinter GUI:
-        * File picker for input (CSV/XLSX).
-        * Entry for Discogs token.
-        * Optional dry-run limit.
-        * Status messages and completion popups.
-    - GUI behavior:
-        * When launched with NO command-line arguments (e.g., double-clicked),
-          the script opens the GUI window.
-        * Output files are automatically named based on the input file:
-              <input_stem>_Output for matched records.csv
-              <input_stem>_Not_Matched.csv
-          and saved in the SAME folder as the input.
-    - CLI behavior:
-        * Still supported. If arguments are provided, the script runs in
-          command-line mode and uses the "output" argument as the matched CSV,
-          and "<output_stem>_unmatched" for the unmatched CSV (legacy pattern).
-
-v1.1.1 – 2025-11-23
-    - Vendor field changed to use the record label (from Discogs) instead of artist.
-    - Shopify product category updated to:
-        "Media > Music & Sound Recordings > Records & LPs".
-    - Added a new "Collection" column in the Shopify output with value:
-        "Vinyl Albums" for all products.
-
-v1.1.0 – 2025-11-23
-    - Added unmatched-record tracking and export to a separate CSV:
-        * Records that fail Discogs search, have no release ID, or fail
-          release-detail fetch are now written to "<output>_unmatched.csv".
-        * Each unmatched row includes an "Unmatched_Reason" column and a
-          "Discogs_Query" column showing artist/title/catalog/country used.
-    - Appended standardized HTML footer to the end of each Description in
-      the Shopify CSV, explaining sleeve protection, stock photos, and
-      quality/inspection process.
-    - Expanded Shop Signage categories to include Pop and Disco with clear
-      priority in the signage logic.
-    - Bumped internal version from v1.0.0 to v1.1.0.
-
-v1.0.0 – 2025-11-23
-    - Baseline tracked version.
-    - Discogs → Shopify pipeline (no GUI).
-    - Uses "Reference Price" column with robust price parsing and rounding to
-      nearest $0.25 (minimum $2.50).
-    - Artist normalization: leading "The " moved to end (e.g., "Beatles, The").
-    - Discogs search: type=release, top match auto-selected (1A + 2A).
-    - Pulls label, year, genre, styles, formats, images, and tracklist HTML.
-    - Estimates weight from Discogs formats (disc quantity → grams + lb).
-    - Shopify CSV mapped to product_template_csv_unit_price fields.
-    - First image: Discogs cover; second: center label photo.
-    - Extensive Shop Signage (genre + styles) with priority logic.
-    - Metafields:
-        custom.album_cover_condition
-        custom.album_condition = "Used"
-        custom.shop_signage
+GUI for Discogs → Shopify vinyl import.
 """
 
 import argparse
@@ -132,13 +34,18 @@ from label_ocr import (
     detect_label_misprint,
 )
 
+DISCOGS_API_BASE = "https://api.discogs.com"
+APP_VERSION = "v1.2.3"
+DISCOGS_USER_AGENT = f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 DISCOGS_API_BASE = "https://api.discogs.com"
-DISCOGS_USER_AGENT = "UnusualFindsDiscogsToShopify/1.2.3 +https://unusualfinds.com"
+
+APP_VERSION = "v1.2.3"
+DISCOGS_USER_AGENT = f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
 
 # Shopify static preferences
 SHOPIFY_PRODUCT_TYPE = "Vinyl Record"
