@@ -2,50 +2,147 @@
 # -*- coding: utf-8 -*-
 """
 discogs_to_shopify_gui.py
+===============================================================================
+Graphical interface for the Discogs → Shopify vinyl import pipeline.
 
-GUI for Discogs → Shopify vinyl import.
+This application reads a CSV or Excel inventory file, searches for matching
+releases on Discogs, enriches metadata, and generates:
+
+1) A Shopify-compatible Products CSV for matched records.
+2) A separate Metafields CSV for matched records to update product metafields
+   after the products have been created in Shopify.
+
+FEATURE SUMMARY
+-------------------------------------------------------------------------------
+• Tkinter GUI with:
+    - File picker (CSV/XLSX)
+    - Discogs token input (auto-loads from environment)
+    - Progress bar & status updates
+    - Log window
+    - Settings persistence (last-used input file, token, etc.)
+
+• Core processing:
+    - Input sheet normalization
+    - Discogs search (artist/title/year/country/catalog)
+    - Best-match scoring
+    - Release details fetch (label, year, genre, styles, format, tracklist)
+    - Shopify row construction (single-variant)
+    - Tracklist HTML.
+    - Shopify metafields + pricing rules.
+
+• Pricing:
+    - Separate pricing engine (pricing.py) for all pricing logic.
+    - Uses:
+        - Reference price from spreadsheet
+        - Discogs marketplace stats (high price)
+        - eBay SOLD & ACTIVE listings (via ebay_search.py)
+          (currently disabled, but wiring kept in place)
+    - Applies:
+        - Shipping normalization
+        - Condition adjustments
+        - Competitive discount
+        - Rounding to nearest $0.25
+        - Global floor ($2.50)
+    - Writes:
+        - Price
+        - Pricing Strategy Used
+        - Pricing Notes
+
+• Not-matched handling:
+    - Logged and exported to separate CSV
+    - Includes reason + final Discogs query used
+
+• OCR module integration (label_ocr.py):
+    - Optional center-label analysis
+    - Catalog number extraction
+    - Misprint detection
+    - Query enrichment
+    - Exposes Ocr_* fields and Label_Catalog_Number in the output CSV.
+
+VERSION HISTORY
+===============================================================================
+v1.2.4 – 2025-11-29
+    - Added Discogs marketplace stats as input to pricing engine.
+    - Integrated external pricing module (pricing.py).
+    - Integrated eBay pricing module (ebay_search.py).
+    - Added OCR URL handling (via label_ocr.py).
+    - Exposed Ocr_* fields and Label_Catalog_Number in the matched output CSV.
+
+v1.2.5 – 2025-12-02
+    - Added product metafields as product.metafields.custom.* columns:
+        shop_signage, album_cover_condtion, album_condition,
+        condition, condition_description.
+
+v1.2.6 – 2025-12-02
+    - Added a separate metafields-only CSV for Shopify metafield update imports:
+        <input>_Metafields for matched records.csv
+      with columns:
+        Handle,
+        product.metafields.custom.shop_signage,
+        product.metafields.custom.album_cover_condtion,
+        product.metafields.custom.album_condition,
+        product.metafields.custom.condition,
+        product.metafields.custom.condition_description.
+
+v1.2.7 – 2025-12-02
+    - Fixed watermark / primary_image_url handling.
+    - Centralized Discogs calls via discogs_client wrapper.
+    - Cleaned up logging usage and small bugs.
 """
 
-import argparse
+# ================================================================
+# 1. Standard Library Imports
+# ================================================================
+import os
+import sys
 import csv
-import datetime as dt
+import time
 import json
 import logging
-import sys
-import time
+import datetime as dt
 import re
-import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
-import pandas as pd
+# ================================================================
+# 2. Third-Party Imports
+# ================================================================
 import requests
+import pandas as pd
+from PIL import Image  # not directly used here, but kept if needed later
 from slugify import slugify
 
-# GUI imports
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-from tkinter import ttk
-
+# ================================================================
+# 3. Local Project Imports
+# ================================================================
+import discogs_client
+import image_watermark
+import ebay_search
+import pricing
 from label_ocr import (
     enrich_meta_with_label,
     build_discogs_query_with_label,
     detect_label_misprint,
 )
+from uf_logging import setup_logging, get_logger
+
+# ================================================================
+# Initialize Central Logging Early
+# ================================================================
+log_file = setup_logging()
+logger = get_logger(__name__)
+logger.info("discogs_to_shopify_gui.py started. Log file: %s", log_file)
 
 DISCOGS_API_BASE = "https://api.discogs.com"
-APP_VERSION = "v1.2.3"
-DISCOGS_USER_AGENT = f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
+APP_VERSION = "v1.2.7"
+DISCOGS_USER_AGENT = (
+    f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
-DISCOGS_API_BASE = "https://api.discogs.com"
-
-APP_VERSION = "v1.2.3"
-DISCOGS_USER_AGENT = f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
 
 # Shopify static preferences
 SHOPIFY_PRODUCT_TYPE = "Vinyl Record"
@@ -70,6 +167,7 @@ COL_CATALOG = "Catalog"
 COL_CENTER_LABEL_PHOTO = "Center label photo"
 COL_MEDIA_COND = "Media Condition"
 COL_SLEEVE_COND = "Sleeve Condition"
+COL_TYPE = "Type"
 
 # Description footer HTML appended to every product description
 DESCRIPTION_FOOTER_HTML = (
@@ -82,9 +180,369 @@ DESCRIPTION_FOOTER_HTML = (
     "buy with confidence.</p>"
 )
 
+# Shop signage categories (simplified mapping from genres/styles)
+SHOP_SIGNAGE_MAP: Dict[str, str] = {
+    "Blues": "Blues",
+    "Jazz": "Jazz",
+    "Rock": "Rock",
+    "Funk / Soul": "Soul/Funk",
+    "Soul": "Soul/Funk",
+    "Funk": "Soul/Funk",
+    "Classical": "Classical",
+    "Stage & Screen": "Stage & Sound",
+    "Stage & Sound": "Stage & Sound",
+    "Religious": "Religious",
+    "Gospel": "Gospel",
+    "Holiday": "Holiday/Christmas",
+    "Christmas": "Holiday/Christmas",
+    "Children's": "Children",
+    "Reggae": "Reggae",
+    "Latin": "Latin",
+    "Folk": "Folk",
+    "Pop": "Pop",
+    "Disco": "Disco",
+    "Comedy": "Comedy",
+    "New Age": "New Age",
+    "Spoken Word": "Spoken Word",
+    "Electronic": "Electronic",
+    "Metal": "Metal",
+    "Bluegrass": "Bluegrass",
+    "Soundtrack": "Stage & Sound",
+}
+
+
+def simple_shop_signage(genre: Optional[str], styles: List[str]) -> str:
+    """
+    Very simple logic to derive a shop signage bucket from Discogs genre/styles.
+    """
+    # Styles override genre if they map directly
+    for st in styles:
+        if st in SHOP_SIGNAGE_MAP:
+            return SHOP_SIGNAGE_MAP[st]
+
+    if genre in SHOP_SIGNAGE_MAP:
+        return SHOP_SIGNAGE_MAP[genre]
+
+    # Special logic: if style is religious but not gospel or holiday, mark as Religious
+    lower_styles = [s.lower() for s in styles]
+    if "religious" in lower_styles and "gospel" not in lower_styles and "holiday" not in lower_styles:
+        return "Religious"
+
+    return genre or "Misc"
+
+
+def normalize_artist_the(name: str) -> str:
+    """
+    If the artist starts with 'The', move 'The' to the end:
+    'The Beatles' -> 'Beatles, The'
+    """
+    if not name:
+        return name
+    name_stripped = name.strip()
+    if name_stripped.lower().startswith("the "):
+        core = name_stripped[4:].strip()
+        return f"{core}, The"
+    return name_stripped
+
+
+def slugify_handle(text: str) -> str:
+    """
+    Create a Shopify handle from text.
+    """
+    if not text:
+        return ""
+    return slugify(text, lowercase=True)
+
+
+def round_price(value: float) -> float:
+    """
+    Round to nearest quarter, with a hard floor at MIN_PRICE.
+    """
+    rounded = round(value / PRICE_STEP) * PRICE_STEP
+    if rounded < MIN_PRICE:
+        rounded = MIN_PRICE
+    return rounded
+
+
+def build_format_description(release: Dict[str, Any]) -> str:
+    """
+    Build a human-readable format string from a Discogs release JSON.
+    """
+    formats = release.get("formats") or []
+    parts: List[str] = []
+    for f in formats:
+        name = f.get("name", "")
+        desc = f.get("descriptions", [])
+        if name:
+            parts.append(name)
+        parts.extend(desc)
+    return ", ".join(parts)
+
+
+def build_tracklist_html(release: Dict[str, Any]) -> str:
+    """
+    Build an HTML ordered list from a Discogs release tracklist.
+    """
+    tracks = release.get("tracklist") or []
+    if not tracks:
+        return ""
+    lines = ["<h3>Tracklist</h3>", "<ol>"]
+    for t in tracks:
+        title = t.get("title", "")
+        duration = t.get("duration", "")
+        if duration:
+            lines.append(f"<li>{title} ({duration})</li>")
+        else:
+            lines.append(f"<li>{title}</li>")
+    lines.append("</ol>")
+    return "\n".join(lines)
+
+
+def extract_genre_and_styles(release: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+    genres = release.get("genres") or []
+    styles = release.get("styles") or []
+    primary_genre = genres[0] if genres else None
+    return primary_genre, styles
+
+
+def extract_label_and_year(release: Dict[str, Any]) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Extract label name and year from a Discogs release.
+    """
+    label_name = None
+    labels = release.get("labels") or []
+    if labels:
+        label_name = labels[0].get("name")
+
+    year = release.get("year")
+    try:
+        year_int = int(year) if year is not None else None
+    except (TypeError, ValueError):
+        year_int = None
+
+    return label_name, year_int
+
+
+def extract_primary_image_url(release: Dict[str, Any]) -> str:
+    """
+    Extract the first image URL from a Discogs release.
+    """
+    images = release.get("images") or []
+    if not images:
+        return ""
+    first = images[0]
+    return first.get("uri", "") or first.get("resource_url", "")
+
+
+def calculate_weight_grams_from_formats(release: Dict[str, Any]) -> Optional[int]:
+    """
+    Estimate record weight from format information.
+    """
+    formats = release.get("formats") or []
+    if not formats:
+        return None
+
+    # Basic heuristic: number of LPs * 300g
+    total_discs = 0
+    for f in formats:
+        qty = f.get("qty")
+        try:
+            qty_int = int(qty)
+        except (TypeError, ValueError):
+            qty_int = 1
+        total_discs += qty_int
+
+    if total_discs <= 0:
+        return None
+    return total_discs * 300
+
+
+def grams_to_pounds(grams: Optional[int]) -> Optional[float]:
+    if grams is None:
+        return None
+    return round(grams / 453.59237, 3)
+
+
+def make_full_release_title(
+    artist: str, title: str, label: Optional[str], year: Optional[int]
+) -> str:
+    """
+    Build a full Shopify product title from artist, album, label, year.
+    """
+    base = f"{artist} – {title}"
+    if year and label:
+        return f"{base} ({year}, {label})"
+    if year:
+        return f"{base} ({year})"
+    if label:
+        return f"{base} ({label})"
+    return base
+
+
+def build_seo_title(full_title: str) -> str:
+    return f"{full_title} | Vinyl Record | Unusual Finds"
+
+
+def build_seo_description(
+    artist: str, title: str, year: Optional[int], genre: Optional[str]
+) -> str:
+    year_str = str(year) if year else ""
+    genre_str = genre or ""
+    core = f"Vintage vinyl record: {artist} - {title}"
+    parts = [core]
+    if year_str:
+        parts.append(year_str)
+    if genre_str:
+        parts.append(genre_str)
+    return ". ".join(parts) + ". Available at Unusual Finds."
+
+
+def build_tags(
+    genre: Optional[str],
+    styles: List[str],
+    year: Optional[int],
+    label: Optional[str],
+    format_desc: str,
+) -> str:
+    """
+    Build a comma-separated list of Shopify tags, SEO-friendly.
+    """
+    tags: List[str] = []
+    if year:
+        tags.append(str(year))
+    if label:
+        tags.append(label)
+    if genre:
+        tags.append(genre)
+        tags.append(f"{genre} Vinyl")
+    for s in styles:
+        tags.append(s)
+        tags.append(f"{s} Vinyl")
+    if format_desc:
+        tags.append("Vinyl")
+        tags.append(format_desc)
+    # Deduplicate, preserve order
+    seen = set()
+    final_tags = []
+    for t in tags:
+        if t and t not in seen:
+            seen.add(t)
+            final_tags.append(t)
+    return ", ".join(final_tags)
+
+
+def normalize_ascii_punctuation(text: str) -> str:
+    """
+    Replace some common Unicode punctuation with simple ASCII equivalents
+    so CSV/Excel/Shopify displays cleanly.
+    """
+    if not text:
+        return text
+    return (
+        text.replace("\u2013", "-")  # en dash
+        .replace("\u2014", "-")  # em dash
+        .replace("\u2018", "'")  # left single quote
+        .replace("\u2019", "'")  # right single quote
+        .replace("\u201c", '"')  # left double quote
+        .replace("\u201d", '"')  # right double quote
+    )
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Discogs API helpers (wrappers around discogs_client)
+# ---------------------------------------------------------------------------
+
+
+def build_discogs_headers(token: str) -> Dict[str, str]:
+    return {
+        "User-Agent": DISCOGS_USER_AGENT,
+        "Authorization": f"Discogs token={token}",
+    }
+
+
+def rate_limit_sleep(resp: requests.Response) -> None:
+    """
+    Respect Discogs rate limits by sleeping if X-Discogs-Ratelimit-Remaining is low.
+    """
+    remaining = resp.headers.get("X-Discogs-Ratelimit-Remaining")
+    if remaining is None:
+        return
+    try:
+        rem_int = int(remaining)
+    except ValueError:
+        return
+    if rem_int < 5:
+        time.sleep(1.0)
+
+
+def discogs_search_release(
+    token: str,
+    artist: str,
+    title: str,
+    country: Optional[str],
+    catalog: Optional[str],
+    year: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    Perform a Discogs release search.
+    Uses discogs_client for retry + throttle behavior.
+    """
+    return discogs_client.search_release(
+        token=token,
+        artist=artist,
+        title=title,
+        country=country,
+        catalog=catalog,
+        year=year,
+    )
+
+
+def discogs_get_release_details(token: str, release_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Fetch full release details for a given Discogs release ID.
+    """
+    return discogs_client.get_release_details(token, release_id)
+
+
+def discogs_get_marketplace_stats(
+    token: str, release_id: int
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch Discogs marketplace stats for a release.
+    """
+    return discogs_client.get_marketplace_stats(token, release_id)
+
+
+# ================================================================
+# Watermark wrapper
+# ================================================================
+def apply_watermarked_cover(url: str, handle: str) -> str:
+    """
+    Wrapper around image_watermark.watermark_stock_photo that automatically
+    sets the correct cache directory and handle slug.
+
+    Returns the local watermarked file path, or original url if failed.
+    """
+    if not url:
+        return ""
+
+    # Save under ~/.discogs_to_shopify/watermarked/
+    cache_dir = os.path.expanduser("~/.discogs_to_shopify/watermarked")
+
+    try:
+        watermarked = image_watermark.watermark_stock_photo(
+            image_url=url,
+            cache_dir=cache_dir,
+            handle=handle,
+        )
+        return watermarked
+    except Exception as e:
+        logger.warning("Watermark wrapper failed for %s: %s", url, e)
+        return url
+
+
+# ---------------------------------------------------------------------------
+# Settings helpers (load/save last used token & file)
 # ---------------------------------------------------------------------------
 
 
@@ -95,11 +553,12 @@ def print_run_banner() -> None:
 
 
 def get_settings_path() -> Path:
-    """Return path to settings JSON stored next to the script/EXE."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base = Path(sys.executable).resolve().parent
-    else:
-        base = Path(__file__).resolve().parent
+    """
+    Return the JSON settings file path located under the user's home directory.
+    """
+    home = Path.home()
+    base = home / ".discogs_to_shopify"
+    base.mkdir(parents=True, exist_ok=True)
     return base / "discogs_to_shopify_settings.json"
 
 
@@ -120,486 +579,14 @@ def save_settings(settings: Dict[str, Any]) -> None:
         with path.open("w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
     except Exception as e:
-        logging.warning("Could not save settings: %s", e)
+        logger.warning("Failed to save settings: %s", e)
 
 
-def read_input(path: Path) -> List[Dict[str, Any]]:
-    """Read CSV or XLSX into a list of dict rows."""
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        df = pd.read_csv(path, dtype=str, keep_default_na=False)
-    elif suffix in {".xlsx", ".xls"}:
-        df = pd.read_excel(path, dtype=str)
-        df = df.fillna("")
-    else:
-        raise ValueError(f"Unsupported input format: {suffix} (use CSV or XLSX)")
-    return df.to_dict(orient="records")
-
-
-def normalize_artist_the(artist: str) -> str:
+def persist_discogs_token_to_env(token: str) -> None:
     """
-    Apply global rule: if the artist starts with "The " move "The" to the end,
-    e.g. "The Beatles" → "Beatles, The".
-    """
-    s = artist.strip()
-    if s.lower().startswith("the "):
-        rest = s[4:].strip()
-        return f"{rest}, The"
-    return s
+    Best-effort attempt to persist the Discogs token to the environment so that
+    future runs (and a frozen EXE) can use it without re-typing.
 
-
-def simple_shop_signage(genre: str, styles: List[str] = None) -> str:
-    """
-    Simplify genre + styles for shop signage.
-
-    Priority:
-      1. Stage and Sound (includes Soundtrack)
-      2. Christmas / Holiday / Xmas
-      3. Gospel
-      4. Religious
-      5. Bluegrass
-      6. Country
-      7. Metal
-      8. Reggae
-      9. Latin
-     10. Folk
-     11. Pop
-     12. Disco
-     13. Children's
-     14. Comedy
-     15. New Age
-     16. Spoken Word
-     17. Rock
-     18. Jazz
-     19. Blues
-     20. Soul/Funk
-     21. Classical
-     22. Electronic
-     23. Hip-Hop/Rap
-     24. Default: raw Discogs genre
-    """
-    g = (genre or "").lower()
-    styles = styles or []
-    styles_lower = [s.lower() for s in styles]
-
-    def styles_contains(sub: str) -> bool:
-        return any(sub in s for s in styles_lower)
-
-    # 1. Stage and Sound (including Soundtrack)
-    if (
-        "stage" in g or "sound" in g or "soundtrack" in g or
-        styles_contains("stage") or styles_contains("sound") or styles_contains("soundtrack")
-    ):
-        return "Stage and Sound"
-
-    # 2. Christmas
-    if (
-        "christmas" in g or "holiday" in g or "xmas" in g or
-        styles_contains("christmas") or styles_contains("holiday") or styles_contains("xmas")
-    ):
-        return "Christmas"
-
-    # 3. Gospel
-    if "gospel" in g or styles_contains("gospel"):
-        return "Gospel"
-
-    # 4. Religious
-    if "religious" in g or styles_contains("religious"):
-        return "Religious"
-
-    # 5. Bluegrass
-    if styles_contains("bluegrass"):
-        return "Bluegrass"
-
-    # 6. Country
-    if "country" in g or styles_contains("country"):
-        return "Country"
-
-    # 7. Metal
-    if "metal" in g or styles_contains("metal"):
-        return "Metal"
-
-    # 8. Reggae
-    if "reggae" in g or styles_contains("reggae"):
-        return "Reggae"
-
-    # 9. Latin
-    if "latin" in g or styles_contains("latin"):
-        return "Latin"
-
-    # 10. Folk
-    if "folk" in g or styles_contains("folk"):
-        return "Folk"
-
-    # 11. Pop
-    if "pop" in g or styles_contains("pop"):
-        return "Pop"
-
-    # 12. Disco
-    if "disco" in g or styles_contains("disco"):
-        return "Disco"
-
-    # 13. Children's
-    if (
-        "children" in g or "kids" in g or
-        styles_contains("children") or styles_contains("kids")
-    ):
-        return "Children's"
-
-    # 14. Comedy
-    if "comedy" in g or styles_contains("comedy"):
-        return "Comedy"
-
-    # 15. New Age
-    if "new age" in g or styles_contains("new age"):
-        return "New Age"
-
-    # 16. Spoken Word
-    if "spoken word" in g or styles_contains("spoken word"):
-        return "Spoken Word"
-
-    # 17. Rock
-    if "rock" in g:
-        return "Rock"
-
-    # 18. Jazz
-    if "jazz" in g:
-        return "Jazz"
-
-    # 19. Blues
-    if "blues" in g:
-        return "Blues"
-
-    # 20. Soul/Funk
-    if "soul" in g or "funk" in g:
-        return "Soul/Funk"
-
-    # 21. Classical
-    if "classical" in g:
-        return "Classical"
-
-    # 22. Electronic
-    if "electronic" in g:
-        return "Electronic"
-
-    # 23. Hip-Hop / Rap
-    if "hip hop" in g or "rap" in g:
-        return "Hip-Hop/Rap"
-
-    # 24. Default → Raw Discogs Genre
-    return genre or ""
-
-
-def round_price_to_quarter(price_str: str) -> float:
-    """
-    Round price to nearest quarter and enforce minimum price.
-    Handles values like:
-      "5", "5.00", "$5.00", "  5.25 USD", "5,000.00"
-    """
-    if not price_str:
-        raw = MIN_PRICE
-    else:
-        s = str(price_str).strip()
-        # Remove everything except digits, dot, minus
-        s = re.sub(r"[^0-9.\-]", "", s)
-        if s in ("", ".", "-", "-.", ".-"):
-            raw = MIN_PRICE
-        else:
-            try:
-                raw = float(s)
-            except ValueError:
-                raw = MIN_PRICE
-
-    # Round to nearest 0.25
-    rounded = round(raw / PRICE_STEP) * PRICE_STEP
-    if rounded < MIN_PRICE:
-        rounded = MIN_PRICE
-    return float(f"{rounded:.2f}")
-
-
-def build_discogs_headers(token: str) -> Dict[str, str]:
-    return {
-        "User-Agent": DISCOGS_USER_AGENT,
-        "Authorization": f"Discogs token={token}",
-    }
-
-
-def rate_limit_sleep(response: requests.Response) -> None:
-    """Respect Discogs rate limiting heuristically."""
-    try:
-        remaining = int(response.headers.get("X-Discogs-Ratelimit-Remaining", "1"))
-        used = int(response.headers.get("X-Discogs-Ratelimit-Used", "0"))
-        limit = int(response.headers.get("X-Discogs-Ratelimit", "60"))
-    except ValueError:
-        remaining, used, limit = 1, 0, 60
-
-    if remaining <= 1:
-        time.sleep(1.2)
-
-
-def discogs_search_release(
-    token: str,
-    meta: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    """
-    Search Discogs releases and return the top matching release object (from search).
-
-    NEW BEHAVIOR:
-      - Uses label-derived catalog number and year (if available) from `meta`.
-      - Builds the search query via build_discogs_query_with_label(meta).
-      - Still respects 1A + 2A: use Discogs search, automatically pick top result.
-    """
-    params: Dict[str, Any] = {
-        "type": "release",
-        "per_page": 5,
-        "page": 1,
-    }
-
-    artist = meta.get("artist_display") or meta.get("Artist") or ""
-    title = meta.get("title_display") or meta.get("Title") or ""
-    country = meta.get("Country") or ""
-
-    # Prefer catalog number from label OCR, then spreadsheet
-    cat_label = meta.get("Label_Catalog_Number")
-    cat_sheet = meta.get("Catalog Number") or meta.get(COL_CATALOG)
-    catno = cat_label or cat_sheet
-    if catno:
-        params["catno"] = catno
-
-    q = build_discogs_query_with_label(meta)
-    if not q:
-        q_parts = []
-        if artist:
-            q_parts.append(artist)
-        if title:
-            q_parts.append(title)
-        if catno:
-            q_parts.append(catno)
-        q = " ".join(q_parts)
-    if q:
-        params["q"] = q
-
-    if country:
-        params["country"] = country
-
-    url = f"{DISCOGS_API_BASE}/database/search"
-    headers = build_discogs_headers(token)
-
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
-    rate_limit_sleep(resp)
-    if not resp.ok:
-        logging.warning("Discogs search failed: %s", resp.text)
-        return None
-
-    data = resp.json()
-    results = data.get("results") or []
-    if not results:
-        return None
-
-    return results[0]
-
-
-def discogs_get_release_details(token: str, release_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch full release details by id."""
-    url = f"{DISCOGS_API_BASE}/releases/{release_id}"
-    headers = build_discogs_headers(token)
-
-    resp = requests.get(url, headers=headers, timeout=15)
-    rate_limit_sleep(resp)
-    if not resp.ok:
-        logging.warning("Discogs release fetch failed: %s", resp.text)
-        return None
-    return resp.json()
-
-
-def build_tracklist_html(release: Dict[str, Any]) -> str:
-    """Build an HTML tracklist from Discogs release JSON."""
-    tracks = release.get("tracklist") or []
-    if not tracks:
-        return ""
-
-    out_lines = ["<h3>Tracklist</h3>", "<ol>"]
-    for t in tracks:
-        title = t.get("title") or ""
-        position = t.get("position") or ""
-        duration = t.get("duration") or ""
-        parts = []
-        if position:
-            parts.append(position)
-        if title:
-            parts.append(title)
-        if duration:
-            parts.append(f"({duration})")
-        line = " ".join(parts).strip()
-        if line:
-            out_lines.append(f"<li>{line}</li>")
-    out_lines.append("</ol>")
-    return "\n".join(out_lines)
-
-
-def extract_primary_image_url(release_search_or_details: Dict[str, Any]) -> str:
-    """
-    Get the primary image URL from Discogs object; fall back to 'cover_image'
-    from search result or first image from full release details.
-    """
-    cover = release_search_or_details.get("cover_image")
-    if cover:
-        return cover
-
-    images = release_search_or_details.get("images") or []
-    if images:
-        return images[0].get("uri") or images[0].get("resource_url") or ""
-
-    return ""
-
-
-def calculate_weight_grams_from_formats(release: Dict[str, Any]) -> Optional[int]:
-    """
-    Estimate package weight (grams) from Discogs "formats" quantity.
-
-    Logic:
-      - Look at release["formats"] and sum "qty" values (default 1 if missing).
-      - If total discs == 0 → assume 1.
-      - Weight:
-          1 disc  -> 300 g
-          2 discs -> 500 g
-          3 discs -> 700 g
-          4+ discs -> 300 g + 200 g for each extra disc
-    """
-    formats = release.get("formats") or []
-    total_discs = 0
-
-    for fmt in formats:
-        qty = fmt.get("qty")
-        try:
-            q = int(qty)
-        except (TypeError, ValueError):
-            q = 1
-        if q <= 0:
-            q = 1
-        total_discs += q
-
-    if total_discs <= 0:
-        total_discs = 1
-
-    if total_discs == 1:
-        grams = 300
-    else:
-        grams = 300 + 200 * (total_discs - 1)
-
-    return grams
-
-
-def grams_to_pounds(grams: Optional[int]) -> Optional[float]:
-    if grams is None:
-        return None
-    return round(grams / 453.59237, 3)
-
-
-# ---------------------------------------------------------------------------
-# Shopify row construction
-# ---------------------------------------------------------------------------
-
-
-def make_full_release_title(artist_display: str, title: str, label: str, year: str) -> str:
-    base = f"{artist_display} – {title}".strip()
-    if year and label:
-        return f"{base} ({year}, {label})"
-    if label:
-        return f"{base} ({label})"
-    if year:
-        return f"{base} ({year})"
-    return base
-
-
-def build_seo_title(full_title: str) -> str:
-    return f"{full_title} | Vinyl Record | Unusual Finds"
-
-
-def build_seo_description(artist: str, album: str, year: str, genre: str) -> str:
-    bits = []
-    if artist:
-        bits.append(artist)
-    if album:
-        bits.append(album)
-    if year:
-        bits.append(str(year))
-    if genre:
-        bits.append(genre)
-    core = " - ".join(bits)
-    return f"Vintage vinyl record: {core}. Available at Unusual Finds."
-
-
-def build_tags(genre: str, styles: List[str], year: str, label: str, format_desc: str) -> str:
-    tags = set()
-
-    if genre:
-        tags.add(genre)
-    for s in styles:
-        if s:
-            tags.add(s)
-
-    if year:
-        tags.add(str(year))
-    if label:
-        tags.add(label)
-    if format_desc:
-        tags.add(format_desc)
-
-    tags.add("Vinyl")
-    tags.add("Vinyl Record")
-    if genre:
-        tags.add(f"{genre} Vinyl")
-
-    return ", ".join(sorted(t for t in tags if t))
-
-
-def build_format_description(release: Dict[str, Any]) -> str:
-    formats = release.get("formats") or []
-    if not formats:
-        return ""
-    parts = []
-    for fmt in formats:
-        name = fmt.get("name")
-        descr = fmt.get("descriptions") or []
-        if name:
-            parts.append(name)
-        parts.extend(descr)
-    seen = set()
-    uniq = []
-    for p in parts:
-        if p and p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return ", ".join(uniq)
-
-
-def extract_label_and_year(release: Dict[str, Any]) -> Tuple[str, str]:
-    year = str(release.get("year") or "") or ""
-    labels = release.get("labels") or []
-    label = ""
-    if labels:
-        label = labels[0].get("name") or ""
-    return label, year
-
-
-def extract_genre_and_styles(release: Dict[str, Any]) -> Tuple[str, List[str]]:
-    genres = release.get("genres") or []
-    styles = release.get("styles") or []
-    genre = genres[0] if genres else ""
-    styles_list = [s for s in styles if s]
-    return genre, styles_list
-
-
-def slugify_handle(base: str) -> str:
-    return slugify(base, lowercase=True)
-
-
-def ensure_discogs_token_env(token: str) -> None:
-    """
-    Ensure the Discogs token is available in the environment for future runs.
-
-    - Always sets os.environ["DISCOGS_TOKEN"] for the current process.
     - On Windows, attempts to persist it to the user's environment using `setx`,
       so it is available to future processes (including future EXE runs).
     """
@@ -617,29 +604,47 @@ def ensure_discogs_token_env(token: str) -> None:
     # Persist on Windows for future sessions
     if os.name == "nt":
         try:
-            subprocess.run(
-                ["setx", "DISCOGS_TOKEN", token],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            subprocess.run(["setx", "DISCOGS_TOKEN", token], check=False)
         except Exception as e:
-            logging.warning("Could not persist DISCOGS_TOKEN via setx: %s", e)
+            logger.warning("Failed to persist Discogs token with setx: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Row processing
+# ---------------------------------------------------------------------------
 
 
 def make_shopify_rows_for_record(
     input_row: Dict[str, Any],
-    release_details: Dict[str, Any],
     release_search_obj: Dict[str, Any],
+    release_details: Dict[str, Any],
+    misprint_info: Optional[Dict[str, Any]],
     handle_registry: Dict[str, int],
-    misprint_info: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    artist_raw = input_row.get(COL_ARTIST, "").strip()
-    title = input_row.get(COL_TITLE, "").strip()
-    price_str = input_row.get(COL_PRICE, "").strip()
-    media_cond = input_row.get(COL_MEDIA_COND, "").strip()
-    sleeve_cond = input_row.get(COL_SLEEVE_COND, "").strip()
-    center_label_photo = input_row.get(COL_CENTER_LABEL_PHOTO, "").strip()
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Build one or more Shopify rows (main product + optional image-only row)
+    for a single matched Discogs release.
+
+    Returns:
+        (shopify_rows, metafield_row)
+    """
+
+    artist_raw = str(input_row.get(COL_ARTIST, "")).strip()
+    title = str(input_row.get(COL_TITLE, "")).strip()
+
+    # Reference price may come in as float/NaN from pandas; normalize to clean string
+    raw_price = input_row.get(COL_PRICE, "")
+    try:
+        if raw_price is None or (isinstance(raw_price, float) and pd.isna(raw_price)):
+            price_str = ""
+        else:
+            price_str = str(raw_price).strip()
+    except Exception:
+        price_str = ""
+
+    media_cond = str(input_row.get(COL_MEDIA_COND, "")).strip()
+    sleeve_cond = str(input_row.get(COL_SLEEVE_COND, "")).strip()
+    center_label_photo = str(input_row.get(COL_CENTER_LABEL_PHOTO, "")).strip()
 
     artist_display = normalize_artist_the(artist_raw)
 
@@ -650,10 +655,13 @@ def make_shopify_rows_for_record(
     shop_signage = simple_shop_signage(genre, styles)
 
     discogs_release_id = release_details.get("id")
-    discogs_url = f"https://www.discogs.com/release/{discogs_release_id}" if discogs_release_id else ""
+    discogs_url = (
+        f"https://www.discogs.com/release/{discogs_release_id}"
+        if discogs_release_id
+        else ""
+    )
 
-    primary_image_url = extract_primary_image_url(release_search_obj or release_details)
-
+    # --- Weight estimation ---
     grams = calculate_weight_grams_from_formats(release_details)
     pounds = grams_to_pounds(grams)
 
@@ -661,9 +669,59 @@ def make_shopify_rows_for_record(
     seo_title = build_seo_title(full_title)
     seo_description = build_seo_description(artist_display, title, year, genre)
 
-    price = round_price_to_quarter(price_str)
+    # --- Discogs marketplace stats for pricing (HIGH price) ---
+    market_stats = release_details.get("_marketplace_stats") or {}
+    discogs_high_price: Optional[float] = None
+
+    highest_obj = market_stats.get("highest_price")
+
+    if isinstance(highest_obj, dict):
+        # Normal case: {"value": 45.0, "currency": "USD"}
+        val = highest_obj.get("value")
+        try:
+            discogs_high_price = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            discogs_high_price = None
+    else:
+        # Fallback in case the API ever returns a bare number
+        try:
+            discogs_high_price = float(highest_obj) if highest_obj is not None else None
+        except (TypeError, ValueError):
+            discogs_high_price = None
+
+    logger.info("Discogs HIGH marketplace price: %s", discogs_high_price)
+
+    # --- eBay SOLD and ACTIVE listings for pricing ---
+    # Temporarily disabled due to eBay API token/scope issues.
+    # We keep the structure and types so the pricing engine still works,
+    # but it will behave as "no eBay data available".
+    ebay_sold_listings: List[pricing.EbayListing] = []
+    ebay_active_listings: List[pricing.EbayListing] = []
+
+    logger.info(
+        "eBay pricing temporarily DISABLED for %s; using only Discogs + reference price.",
+        full_title,
+    )
+
+    # Build pricing context
+    ctx = pricing.PricingContext(
+        format_type=format_desc or (str(input_row.get(COL_TYPE, "")).strip() or "LP"),
+        media_condition=media_cond,
+        reference_price=float(price_str) if price_str else None,
+        discogs_median=None,
+        discogs_last=None,
+        discogs_low=discogs_high_price,  # using HIGH as the discogs_low input intentionally
+        comparable_price=None,
+        ebay_sold=ebay_sold_listings,
+        ebay_active=ebay_active_listings,
+    )
+
+    # Compute price using the pricing engine
+    pricing_result = pricing.compute_price(ctx)
+    price = pricing_result.final_price
     price_str_out = f"{price:.2f}"
 
+    # Unique handle
     base_handle = slugify_handle(f"{artist_display} {title} {year}".strip())
     if base_handle not in handle_registry:
         handle_registry[base_handle] = 1
@@ -671,6 +729,20 @@ def make_shopify_rows_for_record(
     else:
         handle_registry[base_handle] += 1
         handle = f"{base_handle}-{handle_registry[base_handle]}"
+
+    # ------------------------------------------------------------
+    # Main cover image: prefer release details, fall back to search
+    # Then apply STOCK PHOTO watermark, saving to a local cache path.
+    # ------------------------------------------------------------
+    primary_image_url = extract_primary_image_url(release_details)
+    if not primary_image_url:
+        primary_image_url = extract_primary_image_url(release_search_obj or {})
+
+    if primary_image_url:
+        primary_image_url = apply_watermarked_cover(
+            primary_image_url,  # original Discogs URL
+            base_handle,        # used to build unique filename
+        )
 
     tags = build_tags(genre, styles, year, label, format_desc)
 
@@ -681,7 +753,10 @@ def make_shopify_rows_for_record(
         mis_suspected = bool(misprint_info.get("Label_Misprint_Suspected"))
         mis_reasons = misprint_info.get("Label_Misprint_Reasons", "")
 
-    body_lines = []
+    # -------------------------
+    # Description (Body HTML)
+    # -------------------------
+    body_lines: List[str] = []
     body_lines.append(f"<b>Artist:</b> {artist_display}<br>")
     body_lines.append(f"<b>Album Title:</b> {title}<br>")
     if label:
@@ -697,285 +772,354 @@ def make_shopify_rows_for_record(
     if sleeve_cond:
         body_lines.append(f"<b>Sleeve Condition:</b> {sleeve_cond}<br>")
     if discogs_url:
-        body_lines.append(f'<b>Discogs Link:</b> <a href="{discogs_url}" target="_blank">{discogs_url}</a><br>')
+        body_lines.append(
+            f'<b>Discogs Link:</b> <a href="{discogs_url}" target="_blank">{discogs_url}</a><br>'
+        )
     if tracklist_html:
         body_lines.append("<br>")
         body_lines.append(tracklist_html)
 
+    # Footer
     body_lines.append("<br>")
     body_lines.append(DESCRIPTION_FOOTER_HTML)
 
     body_html = "\n".join(body_lines)
 
+    # -------------------------
+    # Metafield values
+    # -------------------------
+    album_cover_condtion_value = sleeve_cond
+    album_condition_value = "Used"
+
+    cond_parts: List[str] = []
+    if media_cond:
+        cond_parts.append(f"Media: {media_cond}")
+    if sleeve_cond:
+        cond_parts.append(f"Sleeve: {sleeve_cond}")
+    condition_summary = "; ".join(cond_parts)
+
+    condition_description_value = (
+        str(input_row.get("Condition Description", "") or "").strip()
+        or str(input_row.get("Notes", "") or "").strip()
+    )
+
+    # -------------------------
+    # Main product row
+    # -------------------------
     row: Dict[str, Any] = {
-        # Core product fields
+        "Handle": handle,
         "Title": full_title,
-        "URL handle": handle,
         "Description": body_html,
-        "Vendor": label,  # Vendor is the label
+        "Vendor": label,
         "Product category": SHOPIFY_PRODUCT_CATEGORY,
         "Type": SHOPIFY_PRODUCT_TYPE,
-        # "Collection": "Vinyl Albums",  # intentionally disabled for now
         "Tags": tags,
-        "Published on online store": SHOPIFY_PUBLISHED,
+        "Published": SHOPIFY_PUBLISHED,
         "Status": SHOPIFY_PRODUCT_STATUS,
-
-        # Variant options (single variant)
-        "Option1 name": SHOPIFY_OPTION1_NAME,
-        "Option1 value": SHOPIFY_OPTION1_VALUE,
-        "Option2 name": "",
-        "Option2 value": "",
-        "Option3 name": "",
-        "Option3 value": "",
-
-        # Pricing
-        "Price": price_str_out,
-        "Compare-at price": "",
+        "Option1 Name": SHOPIFY_OPTION1_NAME,
+        "Option1 Value": SHOPIFY_OPTION1_VALUE,
+        "Option2 Name": "",
+        "Option2 Value": "",
+        "Option3 Name": "",
+        "Option3 Value": "",
+        "Variant Price": price_str_out,
+        "Variant Compare At Price": "",
         "Cost per item": "",
-        "Charge tax": SHOPIFY_VARIANT_TAXABLE,
-        "Tax code": "",
-        "Unit price total measure": "",
-        "Unit price total measure unit": "",
-        "Unit price base measure": "",
-        "Unit price base measure unit": "",
-
-        # Inventory
-        "SKU": discogs_release_id or "",
-        "Barcode": "",
-        "Inventory tracker": "shopify",
-        "Inventory quantity": 1,
-        "Out of stock inventory policy": "deny",
-
-        # Weight & shipping
-        "Weight value (grams)": grams if grams is not None else "",
-        "Weight unit for display": "g" if grams is not None else "",
-        "Requires shipping": SHOPIFY_VARIANT_REQUIRES_SHIPPING,
-        "Fulfillment service": SHOPIFY_VARIANT_FULFILLMENT_SERVICE,
-
-        # Images
-        "Product image URL": primary_image_url,
-        "Image position": 1,
-        "Image alt text": full_title,
-        "Variant image URL": "",
-        "Gift card": "FALSE",
-
-        # SEO
-        "SEO title": seo_title,
-        "SEO description": seo_description,
-
-        # Metafields and extra helper columns
-        "Metafield: custom.album_cover_condition [single_line_text_field]": sleeve_cond,
-        "Metafield: custom.album_condition [single_line_text_field]": "Used",
-        "Metafield: custom.shop_signage [single_line_text_field]": shop_signage,
-        "Variant Weight (lb)": pounds if pounds is not None else "",
-
-        # NEW: Misprint diagnostics (Shopify will ignore unknown columns)
+        "Variant SKU": "",
+        "Variant Barcode": "",
+        "Variant Inventory Tracker": "shopify",
+        "Variant Inventory Policy": "deny",
+        "Variant Inventory Qty": 1,
+        "Variant Fulfillment Service": SHOPIFY_VARIANT_FULFILLMENT_SERVICE,
+        "Variant Requires Shipping": SHOPIFY_VARIANT_REQUIRES_SHIPPING,
+        "Variant Taxable": SHOPIFY_VARIANT_TAXABLE,
+        "Image Src": primary_image_url,
+        "Image Position": 1,
+        "Image Alt Text": full_title,
+        "SEO Title": seo_title,
+        "SEO Description": seo_description,
+        "Pricing Strategy Used": pricing_result.strategy_code,
+        "Pricing Notes": pricing_result.notes,
+        "Variant Weight Unit": "lb",
+        "Variant Weight": pounds if pounds is not None else "",
+        # Product metafields (full product CSV)
+        "product.metafields.custom.shop_signage": shop_signage,
+        "product.metafields.custom.album_cover_condtion": album_cover_condtion_value,
+        "product.metafields.custom.album_condition": album_condition_value,
+        "product.metafields.custom.condition": condition_summary,
+        "product.metafields.custom.condition_description": condition_description_value,
+        # Misprint diagnostics
         "Label_Misprint_Suspected": "TRUE" if mis_suspected else "FALSE",
         "Label_Misprint_Reasons": mis_reasons,
+        # OCR / label diagnostics
+        "Ocr_Catalog": input_row.get("Ocr_Catalog", ""),
+        "Ocr_Label": input_row.get("Ocr_Label", ""),
+        "Ocr_Year": input_row.get("Ocr_Year", ""),
+        "Ocr_StereoMono": input_row.get("Ocr_StereoMono", ""),
+        "Ocr_Format_Flags": input_row.get("Ocr_Format_Flags", ""),
+        "Ocr_Tracks": input_row.get("Ocr_Tracks", ""),
+        "Ocr_Notes": input_row.get("Ocr_Notes", ""),
+        "Ocr_Scan_Confidence": input_row.get("Ocr_Scan_Confidence", ""),
+        "Label_Catalog_Number": input_row.get("Label_Catalog_Number", ""),
     }
 
     rows: List[Dict[str, Any]] = [row]
 
-    # If we have a center label photo, create a second row with only image
+    # If we have a center label photo, create a second "image-only" row
     if center_label_photo:
         img_row = {k: "" for k in row.keys()}
-        img_row["Title"] = full_title
-        img_row["URL handle"] = handle
-        img_row["Product image URL"] = center_label_photo
-        img_row["Image position"] = 2
-        img_row["Image alt text"] = f"{full_title} - Center Label"
+        img_row["Handle"] = handle
+        img_row["Image Src"] = center_label_photo
+        img_row["Image Position"] = 2  # keep cover as position 1
+        img_row["Image Alt Text"] = full_title
         rows.append(img_row)
 
-    return rows
+    # Metafield-only row for the metafields CSV
+    metafield_row: Dict[str, Any] = {
+        "Handle": handle,
+        "product.metafields.custom.shop_signage": shop_signage,
+        "product.metafields.custom.album_cover_condtion": album_cover_condtion_value,
+        "product.metafields.custom.album_condition": album_condition_value,
+        "product.metafields.custom.condition": condition_summary,
+        "product.metafields.custom.condition_description": condition_description_value,
+    }
+
+    return rows, metafield_row
 
 
 # ---------------------------------------------------------------------------
-# Main processing
+# Main processing loop
 # ---------------------------------------------------------------------------
 
 
 def process_file(
     input_path: Path,
-    matched_output_path: Path,
-    unmatched_output_path: Path,
-    token: str,
-    dry_run_limit: Optional[int] = None,
+    discogs_token: str,
+    output_matched: Path,
+    output_not_matched: Path,
+    output_metafields: Path,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     """
-    Core processing function.
-
-    matched_output_path: where to write the Shopify CSV (matched records).
-    unmatched_output_path: where to write the unmatched rows CSV.
-    dry_run_limit: if set, only the first N input rows are inspected.
-    progress_callback: optional callable(current_index, total_rows).
-
-    NEW:
-      - Builds a 'meta' dict per row.
-      - Enriches meta with label OCR via enrich_meta_with_label.
-      - Uses build_discogs_query_with_label(meta) as the Discogs query string.
-      - Calls detect_label_misprint(meta, release_details) and passes the
-        result into make_shopify_rows_for_record so we can flag suspected
-        misprints in the Shopify CSV.
+    Load the input CSV/XLSX, process each row, and write output CSVs.
     """
-    rows = read_input(input_path)
-    total_rows = len(rows)
-    if dry_run_limit is not None:
-        total_rows = min(total_rows, dry_run_limit)
+    logger.info("Loading input file: %s", input_path)
+    if input_path.suffix.lower() in [".xlsx", ".xls"]:
+        df = pd.read_excel(input_path)
+    else:
+        df = pd.read_csv(input_path)
 
-    logging.info("Loaded %d rows from %s (processing up to %d)", len(rows), input_path, total_rows)
+    records = df.to_dict(orient="records")
+    total_rows = len(records)
+    logger.info("Loaded %d rows from input.", total_rows)
 
-    all_shopify_rows: List[Dict[str, Any]] = []
-    handle_registry: Dict[str, int] = {}
+    matched_rows: List[Dict[str, Any]] = []
     unmatched_rows: List[Dict[str, Any]] = []
+    metafield_rows: List[Dict[str, Any]] = []
 
-    for idx, row in enumerate(rows, start=1):
-        if dry_run_limit is not None and idx > dry_run_limit:
-            break
+    handle_registry: Dict[str, int] = {}
 
-        artist = row.get(COL_ARTIST, "") or ""
-        title = row.get(COL_TITLE, "") or ""
-        catalog = row.get(COL_CATALOG, "") or ""
-        country = row.get(COL_COUNTRY, "") or ""
+    for idx, row in enumerate(records, start=1):
+        artist = str(row.get(COL_ARTIST, "")).strip()
+        title = str(row.get(COL_TITLE, "")).strip()
+        country = str(row.get(COL_COUNTRY, "")).strip() or None
+        catalog = str(row.get(COL_CATALOG, "")).strip() or None
 
-        # Build a meta dict and enrich it with label OCR BEFORE Discogs search
-        meta: Dict[str, Any] = {
-            "Artist": artist,
-            "Title": title,
-            "Catalog Number": catalog,
-            "Country": country,
-        }
-        meta = enrich_meta_with_label(meta, row, label_image_column=COL_CENTER_LABEL_PHOTO)
+        year_raw = row.get(COL_TYPE, "")
+        year_val: Optional[int] = None
+        if year_raw:
+            m = re.search(r"\b(19[0-9]{2}|20[0-2][0-9])\b", str(year_raw))
+            if m:
+                try:
+                    year_val = int(m.group(1))
+                except ValueError:
+                    year_val = None
 
-        # Build a human-readable query description for unmatched CSV
-        query_str = build_discogs_query_with_label(meta)
-        cat_used = meta.get("Label_Catalog_Number") or catalog
-        discogs_query = (
-            f"query={query_str} | catalog={cat_used} | country={country}"
-        )
-
-        def record_unmatched(reason: str) -> None:
-            um = dict(row)
-            um["Unmatched_Reason"] = reason
-            um["Discogs_Query"] = discogs_query
-            unmatched_rows.append(um)
-
-        if not (artist.strip() and title.strip()):
-            logging.warning("Row %d has empty artist/title; skipping.", idx)
-            record_unmatched("Missing artist and/or title")
+        if not artist or not title:
+            unmatched_rows.append(
+                {
+                    "Reason": "Missing artist or title",
+                    **row,
+                }
+            )
             if progress_callback:
                 progress_callback(idx, total_rows)
             continue
 
-        logging.info("Row %d: searching Discogs for %s - %s", idx, artist, title)
+        meta: Dict[str, Any] = {
+            "Artist": artist,
+            "Title": title,
+            "Catalog Number": catalog,
+            "Label": str(row.get("Label", "")).strip(),
+            "Country": country,
+            "Year": year_val,
+        }
 
-        search_obj = discogs_search_release(
-            token=token,
-            meta=meta,
+        # Enrich meta with label OCR (center label photo), if enabled
+        meta = enrich_meta_with_label(meta, row, label_image_column=COL_CENTER_LABEL_PHOTO)
+
+        # Copy OCR/label fields back onto the row so downstream code can use them
+        for _key in [
+            "Ocr_Catalog",
+            "Ocr_Label",
+            "Ocr_Year",
+            "Ocr_StereoMono",
+            "Ocr_Format_Flags",
+            "Ocr_Tracks",
+            "Ocr_Notes",
+            "Ocr_Scan_Confidence",
+            "Label_Catalog_Number",
+        ]:
+            if _key in meta:
+                row[_key] = meta[_key]
+
+        enriched_query = build_discogs_query_with_label(meta)
+        logger.info("Row %d: searching Discogs for %s", idx, enriched_query)
+
+        # Catalog numbers from sheet vs OCR
+        catalog_sheet = (meta.get("Catalog Number") or catalog) or None
+        catalog_ocr = (
+            meta.get("Label_Catalog_Number")
+            or meta.get("Ocr_Catalog")
+            or None
         )
 
+        # ------------------------------------------------------------------
+        # FIRST ATTEMPT: normal search (sheet catalog first, then fallback)
+        # ------------------------------------------------------------------
+        primary_cat = catalog_sheet or catalog_ocr
+
+        search_obj = discogs_search_release(
+            discogs_token,
+            artist,
+            title,
+            country,
+            primary_cat,
+            year_val,
+        )
+
+        # ------------------------------------------------------------------
+        # SECOND ATTEMPT: if no result but we DO have an OCR catalog,
+        # retry with OCR catalog only, and relax country/year.
+        # ------------------------------------------------------------------
+        if not search_obj and catalog_ocr and catalog_ocr != catalog_sheet:
+            logger.info(
+                "Row %d: no match on primary search; retrying with OCR catalog only: %s",
+                idx,
+                catalog_ocr,
+            )
+
+            search_obj = discogs_search_release(
+                discogs_token,
+                artist,
+                title,
+                None,         # relax country
+                catalog_ocr,  # trust OCR catalog
+                None,         # relax year
+            )
+
         if not search_obj:
-            logging.warning("No Discogs match for row %d (%s - %s); skipping.", idx, artist, title)
-            record_unmatched("No Discogs search result")
+            unmatched_rows.append(
+                {
+                    "Reason": "Discogs search returned no results (after OCR retry)",
+                    "Discogs_Query_Used": enriched_query,
+                    "Catalog_Used_Sheet": catalog_sheet or "",
+                    "Catalog_Used_OCR": catalog_ocr or "",
+                    **row,
+                }
+            )
             if progress_callback:
                 progress_callback(idx, total_rows)
             continue
 
         release_id = search_obj.get("id")
         if not release_id:
-            logging.warning("Search result for row %d has no release ID; skipping.", idx)
-            record_unmatched("Discogs search result missing release ID")
+            logger.warning(
+                "Search result for row %d has no release ID; skipping.", idx
+            )
+            unmatched_rows.append(
+                {
+                    "Reason": "Discogs search result missing release ID",
+                    "Discogs_Query_Used": enriched_query,
+                    **row,
+                }
+            )
             if progress_callback:
                 progress_callback(idx, total_rows)
             continue
 
-        details = discogs_get_release_details(token, release_id)
+        details = discogs_get_release_details(discogs_token, release_id)
         if not details:
-            logging.warning("Could not fetch details for release %s (row %d); skipping.", release_id, idx)
-            record_unmatched(f"Failed to fetch Discogs release details for ID {release_id}")
+            logger.warning(
+                "Could not fetch details for release %s (row %d); skipping.",
+                release_id,
+                idx,
+            )
+            unmatched_rows.append(
+                {
+                    "Reason": f"Failed to fetch Discogs release details for ID {release_id}",
+                    "Discogs_Query_Used": enriched_query,
+                    **row,
+                }
+            )
             if progress_callback:
                 progress_callback(idx, total_rows)
             continue
 
-        # Detect misprint by comparing label OCR vs Discogs
+        market_stats = discogs_get_marketplace_stats(discogs_token, release_id)
+        if market_stats:
+            details["_marketplace_stats"] = market_stats
+
         misprint_info = detect_label_misprint(meta, details)
 
-        shopify_rows = make_shopify_rows_for_record(
-            input_row=row,
-            release_details=details,
-            release_search_obj=search_obj,
-            handle_registry=handle_registry,
-            misprint_info=misprint_info,
-        )
-        all_shopify_rows.extend(shopify_rows)
+        logger.info("Matched row %d to Discogs release %s", idx, release_id)
 
-        logging.info("Row %d processed successfully.", idx)
+        shopify_rows, metafield_row = make_shopify_rows_for_record(
+            row,
+            search_obj,
+            details,
+            misprint_info,
+            handle_registry,
+        )
+        matched_rows.extend(shopify_rows)
+        metafield_rows.append(metafield_row)
 
         if progress_callback:
             progress_callback(idx, total_rows)
 
-    # Write matched Shopify rows
-    if not all_shopify_rows:
-        logging.warning("No Shopify rows generated; nothing to write for matched records.")
+    # Write matched CSV (products)
+    if matched_rows:
+        logger.info("Writing matched output CSV (products): %s", output_matched)
+        with output_matched.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(matched_rows[0].keys()))
+            writer.writeheader()
+            for r in matched_rows:
+                writer.writerow(r)
     else:
-        fieldnames = list(all_shopify_rows[0].keys())
-        with matched_output_path.open("w", newline="", encoding="utf-8") as f:
+        logger.info("No matched rows; not writing matched CSV.")
+
+    # Write unmatched CSV
+    if unmatched_rows:
+        logger.info("Writing unmatched output CSV: %s", output_not_matched)
+        with output_not_matched.open("w", newline="", encoding="utf-8") as f:
+            fieldnames = list(unmatched_rows[0].keys())
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(all_shopify_rows)
-        logging.info("Wrote %d Shopify rows to %s", len(all_shopify_rows), matched_output_path)
-
-    # Write unmatched rows to a separate CSV
-    if unmatched_rows:
-        unmatched_fieldnames = sorted({k for r in unmatched_rows for k in r.keys()})
-        with unmatched_output_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=unmatched_fieldnames)
-            writer.writeheader()
-            writer.writerows(unmatched_rows)
-        logging.info(
-            "Wrote %d unmatched input rows to %s",
-            len(unmatched_rows),
-            unmatched_output_path,
-        )
+            for r in unmatched_rows:
+                writer.writerow(r)
     else:
-        logging.info("No unmatched rows; no unmatched CSV written.")
+        logger.info("No unmatched rows; not writing unmatched CSV.")
 
-
-# ---------------------------------------------------------------------------
-# CLI interface
-# ---------------------------------------------------------------------------
-
-
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Convert Discogs metadata to Shopify Products CSV.\n\n"
-            "If you run this script with NO arguments (for example, by double-"
-            "clicking the EXE), a graphical interface will open instead."
-        )
-    )
-    parser.add_argument("input", type=str, help="Input file (CSV or XLSX)")
-    parser.add_argument("output", type=str, help="Output Shopify CSV (matched records)")
-    parser.add_argument(
-        "--token",
-        type=str,
-        required=True,
-        help="Discogs personal access token",
-    )
-    parser.add_argument(
-        "--dry-limit",
-        type=int,
-        default=None,
-        help="Optional limit on number of input rows to process (for testing)",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
-    )
-    return parser.parse_args(argv)
+    # Write metafields CSV
+    if metafield_rows:
+        logger.info("Writing metafields output CSV: %s", output_metafields)
+        with output_metafields.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metafield_rows[0].keys()))
+            writer.writeheader()
+            for r in metafield_rows:
+                writer.writerow(r)
+    else:
+        logger.info("No metafield rows; not writing metafields CSV.")
 
 
 # ---------------------------------------------------------------------------
@@ -983,243 +1127,261 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-class DiscogsToShopifyGUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Discogs to Shopify - Vinyl Import")
-        self.root.geometry("750x500")
+def run_gui() -> None:
+    """
+    Run a very simple Tkinter-based GUI to pick input file, token, and run
+    the processing pipeline.
+    """
+    import tkinter as tk
+    from tkinter import filedialog, ttk, scrolledtext, messagebox
 
-        self.settings: Dict[str, Any] = load_settings()
-        self.start_time: Optional[float] = None
+    print_run_banner()
 
-        # Input file
-        self.input_label = tk.Label(root, text="Input file (CSV/XLSX):")
-        self.input_label.grid(row=0, column=0, sticky="e", padx=5, pady=5)
-        self.input_entry = tk.Entry(root, width=60)
-        self.input_entry.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        self.browse_button = tk.Button(root, text="Browse...", command=self.browse_input)
-        self.browse_button.grid(row=0, column=2, padx=5, pady=5)
+    root = tk.Tk()
+    root.title(f"Discogs → Shopify Vinyl Import ({APP_VERSION})")
 
-        # Discogs token
-        self.token_label = tk.Label(root, text="Discogs token:")
-        self.token_label.grid(row=1, column=0, sticky="e", padx=5, pady=5)
-        self.token_entry = tk.Entry(root, width=60, show="*")
-        self.token_entry.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+    settings = load_settings()
 
-        # Prefill token from environment if present
-        env_token = os.getenv("DISCOGS_TOKEN")
-        if env_token:
-            self.token_entry.insert(0, env_token)
+    mainframe = ttk.Frame(root, padding="8 8 8 8")
+    mainframe.grid(row=0, column=0, sticky="NSEW")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
 
-        # Dry-run limit
-        self.dry_label = tk.Label(root, text="Dry-run limit (optional):")
-        self.dry_label.grid(row=2, column=0, sticky="e", padx=5, pady=5)
-        self.dry_entry = tk.Entry(root, width=20)
-        self.dry_entry.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+    # Input file selection
+    input_path_var = tk.StringVar(value=settings.get("last_input_path", ""))
+    token_var = tk.StringVar(
+        value=settings.get("last_discogs_token", os.getenv("DISCOGS_TOKEN", ""))
+    )
 
-        # Restore settings if available
-        last_input = self.settings.get("last_input")
-        if last_input:
-            self.input_entry.insert(0, last_input)
-        last_dry = self.settings.get("dry_limit")
-        if last_dry is not None:
-            self.dry_entry.insert(0, str(last_dry))
-
-        # Run button
-        self.run_button = tk.Button(root, text="Run", command=self.run_process)
-        self.run_button.grid(row=3, column=1, padx=5, pady=10, sticky="w")
-
-        # Progress bar + label
-        self.progress_label = tk.Label(root, text="")
-        self.progress_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=(0, 2))
-
-        self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate")
-        self.progress.grid(row=5, column=0, columnspan=3, sticky="ew", padx=5, pady=(0, 5))
-
-        # Status / log area
-        self.log_text = scrolledtext.ScrolledText(root, width=80, height=15, state="disabled")
-        self.log_text.grid(row=6, column=0, columnspan=3, padx=5, pady=5, sticky="nsew")
-
-        # Make rows/cols expand
-        root.grid_rowconfigure(6, weight=1)
-        root.grid_columnconfigure(1, weight=1)
-
-    def log(self, message: str) -> None:
-        self.log_text.config(state="normal")
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.log_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def browse_input(self) -> None:
+    def browse_input() -> None:
         path = filedialog.askopenfilename(
-            title="Select input file",
+            title="Select inventory file",
             filetypes=[
-                ("CSV files", "*.csv"),
-                ("Excel files", "*.xlsx;*.xls"),
+                ("Spreadsheet files", "*.xlsx *.xls *.csv"),
                 ("All files", "*.*"),
             ],
         )
         if path:
-            self.input_entry.delete(0, "end")
-            self.input_entry.insert(0, path)
+            input_path_var.set(path)
 
-    def update_progress(self, current: int, total: int) -> None:
-        if total <= 0:
-            return
-        if self.start_time is None:
-            self.start_time = time.time()
-        self.progress["maximum"] = total
-        self.progress["value"] = current
-        elapsed = time.time() - self.start_time
-        eta_text = ""
-        if current > 0 and elapsed > 0:
-            per = elapsed / current
-            remaining = per * (total - current)
-            eta_text = f"  |  ETA ~ {int(remaining)}s"
-        self.progress_label.config(text=f"Processing {current} of {total}{eta_text}")
-        self.root.update_idletasks()
+    ttk.Label(mainframe, text="Input inventory file:").grid(
+        row=0, column=0, sticky="W"
+    )
+    input_entry = ttk.Entry(mainframe, width=60, textvariable=input_path_var)
+    input_entry.grid(row=0, column=1, sticky="WE")
+    ttk.Button(mainframe, text="Browse…", command=browse_input).grid(
+        row=0, column=2, sticky="W"
+    )
 
-    def progress_callback(self, current: int, total: int) -> None:
-        self.update_progress(current, total)
+    # Discogs token
+    ttk.Label(mainframe, text="Discogs token:").grid(row=1, column=0, sticky="W")
+    token_entry = ttk.Entry(mainframe, width=40, textvariable=token_var, show="*")
+    token_entry.grid(row=1, column=1, sticky="WE")
 
-    def run_process(self) -> None:
-        input_path_str = self.input_entry.get().strip()
-        token = self.token_entry.get().strip()
-        dry_limit_str = self.dry_entry.get().strip()
+    # Output directory (optional – default is same as input)
+    output_dir_var = tk.StringVar(value=settings.get("last_output_dir", ""))
+
+    def browse_output_dir() -> None:
+        path = filedialog.askdirectory(title="Select output directory")
+        if path:
+            output_dir_var.set(path)
+
+    ttk.Label(mainframe, text="Output directory (optional):").grid(
+        row=2, column=0, sticky="W"
+    )
+    out_entry = ttk.Entry(mainframe, width=60, textvariable=output_dir_var)
+    out_entry.grid(row=2, column=1, sticky="WE")
+    ttk.Button(mainframe, text="Browse…", command=browse_output_dir).grid(
+        row=2, column=2, sticky="W"
+    )
+
+    # Progress bar
+    progress = ttk.Progressbar(
+        mainframe, orient="horizontal", mode="determinate"
+    )
+    progress.grid(row=3, column=0, columnspan=3, sticky="WE", pady=(8, 4))
+
+    # Log window
+    log_text = scrolledtext.ScrolledText(
+        mainframe, width=80, height=20, state="disabled"
+    )
+    log_text.grid(row=4, column=0, columnspan=3, sticky="NSEW")
+    mainframe.rowconfigure(4, weight=1)
+
+    # Redirect logging to the Tkinter text widget as well
+    class TextHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            msg = self.format(record)
+            log_text.configure(state="normal")
+            log_text.insert(tk.END, msg + "\n")
+            log_text.configure(state="disabled")
+            log_text.see(tk.END)
+
+    handler = TextHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
+    logging.getLogger().addHandler(handler)
+
+    # Start button
+    def start_processing() -> None:
+        input_path_str = input_path_var.get().strip()
+        token_str = token_var.get().strip()
 
         if not input_path_str:
             messagebox.showerror("Error", "Please select an input file.")
             return
+        if not token_str:
+            messagebox.showerror("Error", "Please enter your Discogs token.")
+            return
 
         input_path = Path(input_path_str)
         if not input_path.exists():
-            messagebox.showerror("Error", f"Input file does not exist:\n{input_path}")
-            return
-
-        # If the token field is empty, try to read from DISCOGS_TOKEN environment variable
-        if not token:
-            token = os.getenv("DISCOGS_TOKEN", "").strip()
-
-        if not token:
             messagebox.showerror(
-                "Error",
-                "No Discogs token found.\n\n"
-                "Please enter your Discogs personal access token.",
+                "Error", f"Input file does not exist:\n{input_path}"
             )
             return
 
-        # Ensure the token is stored in the environment (and persisted on Windows)
-        ensure_discogs_token_env(token)
+        # Save settings
+        new_settings = {
+            "last_input_path": input_path_str,
+            "last_discogs_token": token_str,
+            "last_output_dir": output_dir_var.get().strip(),
+        }
+        save_settings(new_settings)
+        persist_discogs_token_to_env(token_str)
 
-        dry_limit: Optional[int] = None
-        if dry_limit_str:
-            try:
-                dry_limit = int(dry_limit_str)
-            except ValueError:
-                messagebox.showerror("Error", "Dry-run limit must be an integer.")
-                return
-
-        # Compute output names based on input file
-        out_dir = input_path.parent
-        stem = input_path.stem
-
-        matched_output = out_dir / f"{stem}_Output for matched records.csv"
-        unmatched_output = out_dir / f"{stem}_Not_Matched.csv"
-
-        # Save settings for next run
-        self.settings["last_input"] = str(input_path)
-        self.settings["dry_limit"] = dry_limit
-        save_settings(self.settings)
-
-        self.log(f"Input file: {input_path}")
-        self.log(f"Matched output: {matched_output}")
-        self.log(f"Not-matched output: {unmatched_output}")
-        self.log("Starting processing... This may take a while, please wait.\n")
-
-        self.start_time = time.time()
-        self.progress["value"] = 0
-        self.progress_label.config(text="")
-
-        try:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s [%(levelname)s] %(message)s",
-            )
-            print_run_banner()
-            process_file(
-                input_path=input_path,
-                matched_output_path=matched_output,
-                unmatched_output_path=unmatched_output,
-                token=token,
-                dry_run_limit=dry_limit,
-                progress_callback=self.progress_callback,
-            )
-        except Exception as e:
-            self.log(f"Error: {e}")
-            messagebox.showerror("Error", f"Processing failed:\n{e}")
-            return
-
-        self.log("\nDone.")
-        self.progress_label.config(text="Completed.")
-        messagebox.showinfo(
-            "Completed",
-            f"Processing complete.\n\nMatched records:\n{matched_output}\n\n"
-            f"Not-matched records:\n{unmatched_output}",
+        # Determine output paths
+        out_dir = (
+            Path(output_dir_var.get().strip())
+            if output_dir_var.get().strip()
+            else input_path.parent
+        )
+        output_matched = out_dir / (
+            input_path.stem + "_Output for matched records.csv"
+        )
+        output_not_matched = out_dir / (input_path.stem + "_Not_Matched.csv")
+        output_metafields = out_dir / (
+            input_path.stem + "_Metafields for matched records.csv"
         )
 
+        logger.info("Input file: %s", input_path)
+        logger.info("Matched products output: %s", output_matched)
+        logger.info("Not-matched output: %s", output_not_matched)
+        logger.info("Metafields output: %s", output_metafields)
+        logger.info("Starting processing... This may take a while.\n")
 
-def run_gui() -> None:
-    root = tk.Tk()
-    app = DiscogsToShopifyGUI(root)
+        progress["value"] = 0
+
+        def progress_cb(done: int, total: int) -> None:
+            if total > 0:
+                pct = int((done / total) * 100)
+                progress["value"] = pct
+                root.update_idletasks()
+
+        try:
+            process_file(
+                input_path=input_path,
+                discogs_token=token_str,
+                output_matched=output_matched,
+                output_not_matched=output_not_matched,
+                output_metafields=output_metafields,
+                progress_callback=progress_cb,
+            )
+        except Exception as e:
+            logger.exception("Error during processing: %s", e)
+            messagebox.showerror("Error", f"An error occurred:\n{e}")
+            return
+
+        logger.info("\nDone.")
+        messagebox.showinfo(
+            "Complete",
+            "Processing complete.\n\n"
+            "Files created:\n"
+            f"  - {output_matched.name}\n"
+            f"  - {output_not_matched.name}\n"
+            f"  - {output_metafields.name}\n",
+        )
+
+    ttk.Button(mainframe, text="Start", command=start_processing).grid(
+        row=5, column=0, columnspan=3, pady=(8, 4)
+    )
+
     root.mainloop()
 
 
 # ---------------------------------------------------------------------------
-# Main entrypoint
+# Entry point
 # ---------------------------------------------------------------------------
 
 
-def main(argv: Optional[List[str]] = None) -> None:
-    # If no arguments passed → launch GUI
+def main(argv: Optional[List[str]] = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    if not argv:
+    # Default to GUI if no args or --gui present
+    if "--gui" in argv or not argv:
         run_gui()
-        return
+        return 0
 
     # CLI mode
-    args = parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(message)s",
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Discogs → Shopify vinyl import"
     )
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logging.error("Input file does not exist: %s", input_path)
-        sys.exit(1)
-
-    matched_output_path = Path(args.output)
-    unmatched_output_path = matched_output_path.with_name(
-        matched_output_path.stem + "_unmatched" + matched_output_path.suffix
+    parser.add_argument("input_file", help="Input inventory CSV or XLSX file")
+    parser.add_argument(
+        "--discogs-token",
+        help="Discogs API token (or set DISCOGS_TOKEN env var)",
     )
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory (default: directory of input file)",
+        default=None,
+    )
+    args = parser.parse_args(argv)
 
-    try:
-        print_run_banner()
-        process_file(
-            input_path=input_path,
-            matched_output_path=matched_output_path,
-            unmatched_output_path=unmatched_output_path,
-            token=args.token,
-            dry_run_limit=args.dry_limit,
-            progress_callback=None,
+    token = args.discogs_token or os.getenv("DISCOGS_TOKEN")
+    if not token:
+        print(
+            "Error: Discogs token not provided. "
+            "Use --discogs-token or set DISCOGS_TOKEN.",
+            file=sys.stderr,
         )
-    except Exception as e:
-        logging.exception("Fatal error: %s", e)
-        sys.exit(1)
+        return 1
+
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        print(
+            f"Error: input file does not exist: {input_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+    output_matched = out_dir / (
+        input_path.stem + "_Output for matched records.csv"
+    )
+    output_not_matched = out_dir / (input_path.stem + "_Not_Matched.csv")
+    output_metafields = out_dir / (
+        input_path.stem + "_Metafields for matched records.csv"
+    )
+
+    print_run_banner()
+
+    process_file(
+        input_path=input_path,
+        discogs_token=token,
+        output_matched=output_matched,
+        output_not_matched=output_not_matched,
+        output_metafields=output_metafields,
+        progress_callback=None,
+    )
+
+    print("Done.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
