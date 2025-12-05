@@ -88,6 +88,11 @@ v1.2.7 – 2025-12-02
     - Fixed watermark / primary_image_url handling.
     - Centralized Discogs calls via discogs_client wrapper.
     - Cleaned up logging usage and small bugs.
+
+v1.2.8 – 2025-12-02
+    - Removed image watermarking logic and image_watermark dependency.
+    - Added metafield product.metafields.custom.uses_stock_photo to flag Discogs
+      cover images as stock photos (in both product CSV and metafields CSV).
 """
 
 # ================================================================
@@ -102,6 +107,7 @@ import logging
 import datetime as dt
 import re
 import subprocess
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
@@ -110,14 +116,13 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 # ================================================================
 import requests
 import pandas as pd
-from PIL import Image  # not directly used here, but kept if needed later
+from PIL import Image  # retained in case of future image handling
 from slugify import slugify
 
 # ================================================================
 # 3. Local Project Imports
 # ================================================================
 import discogs_client
-import image_watermark
 import ebay_search
 import pricing
 from label_ocr import (
@@ -127,18 +132,15 @@ from label_ocr import (
 )
 from uf_logging import setup_logging, get_logger
 
-# ================================================================
-# Initialize Central Logging Early
-# ================================================================
-log_file = setup_logging()
-logger = get_logger(__name__)
-logger.info("discogs_to_shopify_gui.py started. Log file: %s", log_file)
-
-DISCOGS_API_BASE = "https://api.discogs.com"
-APP_VERSION = "v1.2.7"
-DISCOGS_USER_AGENT = (
-    f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
-)
+# ---------------------------------------------------------------------------
+# Default Paths / App Structure
+# ---------------------------------------------------------------------------
+DEFAULT_BASE_DIR = Path.home() / "Documents" / "UnusualFindsAlbumApp"
+INPUT_DIR_NAME = "input"
+OUTPUT_DIR_NAME = "output"
+LOGS_DIR_NAME = "logs"
+CACHE_DIR_NAME = "cache"
+PROCESSED_DIR_NAME = "processed"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -448,6 +450,126 @@ def normalize_ascii_punctuation(text: str) -> str:
     )
 
 
+def normalize_inventory_date(value: Any) -> str:
+    """
+    Normalize an inventory date to YYYY-MM-DD (Shopify date metafield).
+    Fallback to today's date if missing or unparseable.
+    """
+    today = dt.date.today().isoformat()
+    if value is None:
+        return today
+
+    try:
+        import pandas as _pd  # type: ignore
+        if _pd.isna(value):  # pragma: no cover
+            return today
+    except Exception:
+        pass
+
+    if isinstance(value, dt.datetime):
+        return value.date().isoformat()
+    if isinstance(value, dt.date):
+        return value.isoformat()
+
+    s = str(value).strip()
+    if not s:
+        return today
+
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    try:
+        return dt.date.fromisoformat(s).isoformat()
+    except Exception:
+        return today
+
+
+def normalize_discogs_suggestion_key(key: str) -> Optional[str]:
+    """
+    Map Discogs price suggestion condition labels to our normalized ladder.
+    """
+    k = key.lower()
+    if "mint (m)" in k and "near" not in k:
+        return "M"
+    if "near mint" in k or "m-" in k:
+        return "NM"
+    if "vg+" in k or "very good plus" in k or "excellent" in k:
+        return "VG+"
+    if "very good" in k and "+" not in k:
+        return "VG"
+    if "good plus" in k or "g+" in k:
+        return "G+"
+    if k.startswith("good"):
+        return "G"
+    if "fair" in k or "poor" in k:
+        return "F/P"
+    return None
+
+
+def discogs_price_from_suggestions(
+    media_condition: str, suggestions: Dict[str, Any]
+) -> Optional[float]:
+    """
+    Pick a price suggestion based on media condition.
+
+    - Exact match: use that value.
+    - Otherwise: take the next lower condition (if present) minus 10%.
+    - If no lower condition is available: take the next higher condition minus 10%.
+    - Sleeve condition is ignored.
+    """
+    if not suggestions:
+        return None
+
+    norm_media = pricing.normalize_condition(media_condition)
+    if not norm_media:
+        return None
+
+    # Normalize suggestion keys to ladder values
+    norm_map: Dict[str, float] = {}
+    for key, obj in suggestions.items():
+        if not isinstance(obj, dict):
+            continue
+        norm_key = normalize_discogs_suggestion_key(str(key))
+        if not norm_key:
+            continue
+        try:
+            val = obj.get("value")
+            price_val = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            price_val = None
+        if price_val is not None:
+            norm_map[norm_key] = price_val
+
+    if not norm_map:
+        return None
+
+    ladder = pricing.CONDITION_LADDER
+    if norm_media in norm_map:
+        return norm_map[norm_media]
+
+    # Search next lower condition first
+    try:
+        idx = ladder.index(norm_media)
+    except ValueError:
+        return None
+
+    for j in range(idx + 1, len(ladder)):
+        cond = ladder[j]
+        if cond in norm_map:
+            return norm_map[cond] * 0.9
+
+    # Then search next higher condition
+    for j in range(idx - 1, -1, -1):
+        cond = ladder[j]
+        if cond in norm_map:
+            return norm_map[cond] * 0.9
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Discogs API helpers (wrappers around discogs_client)
 # ---------------------------------------------------------------------------
@@ -513,32 +635,24 @@ def discogs_get_marketplace_stats(
     return discogs_client.get_marketplace_stats(token, release_id)
 
 
-# ================================================================
-# Watermark wrapper
-# ================================================================
-def apply_watermarked_cover(url: str, handle: str) -> str:
+
+
+def sanitize_catalog_for_search(cat: Optional[str]) -> Optional[str]:
+    """Clean a catalog number for searching.
+
+    If it looks like it's just a year (e.g. 1969, 1972), ignore it — that's
+    almost always an OCR misread from the center label.
     """
-    Wrapper around image_watermark.watermark_stock_photo that automatically
-    sets the correct cache directory and handle slug.
+    if not cat:
+        return None
+    s = str(cat).strip()
+    # Collapse spaces/hyphens just for the year check
+    compact = re.sub(r"[\s-]", "", s)
+    if re.fullmatch(r"(19[0-9]{2}|20[0-2][0-9])", compact):
+        return None
+    return s or None
 
-    Returns the local watermarked file path, or original url if failed.
-    """
-    if not url:
-        return ""
 
-    # Save under ~/.discogs_to_shopify/watermarked/
-    cache_dir = os.path.expanduser("~/.discogs_to_shopify/watermarked")
-
-    try:
-        watermarked = image_watermark.watermark_stock_photo(
-            image_url=url,
-            cache_dir=cache_dir,
-            handle=handle,
-        )
-        return watermarked
-    except Exception as e:
-        logger.warning("Watermark wrapper failed for %s: %s", url, e)
-        return url
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +664,48 @@ def print_run_banner() -> None:
     """Print a line showing when this script is running."""
     now = dt.datetime.now().isoformat(timespec="seconds")
     print(f"[discogs_to_shopify] Run at {now}", flush=True)
+
+
+def open_path(path: Path) -> None:
+    """
+    Open a file or folder in the platform file browser.
+    """
+    if not path:
+        return
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+    except Exception as e:
+        try:
+            logger.warning("Failed to open path %s: %s", path, e)
+        except NameError:
+            print(f"Failed to open path {path}: {e}")
+
+def ensure_base_dirs(base_dir: Path) -> Dict[str, Path]:
+    """
+    Ensure the base directory structure exists and return key paths.
+    """
+    input_dir = base_dir / INPUT_DIR_NAME
+    output_dir = base_dir / OUTPUT_DIR_NAME
+    logs_dir = base_dir / LOGS_DIR_NAME
+    cache_dir = base_dir / CACHE_DIR_NAME
+    processed_dir = input_dir / PROCESSED_DIR_NAME
+
+    for d in [base_dir, input_dir, output_dir, logs_dir, cache_dir, processed_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "base": base_dir,
+        "input": input_dir,
+        "output": output_dir,
+        "logs": logs_dir,
+        "cache": cache_dir,
+        "processed": processed_dir,
+    }
 
 
 def get_settings_path() -> Path:
@@ -568,9 +724,12 @@ def load_settings() -> Dict[str, Any]:
         return {}
     try:
         with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return {}
+        data = {}
+    if "base_dir" not in data or not data.get("base_dir"):
+        data["base_dir"] = str(DEFAULT_BASE_DIR)
+    return data
 
 
 def save_settings(settings: Dict[str, Any]) -> None:
@@ -579,7 +738,30 @@ def save_settings(settings: Dict[str, Any]) -> None:
         with path.open("w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
     except Exception as e:
-        logger.warning("Failed to save settings: %s", e)
+        try:
+            logger.warning("Failed to save settings: %s", e)
+        except NameError:
+            print(f"Failed to save settings: {e}")
+
+
+# ---------------------------------------------------------------------------
+# App metadata and bootstrap (base dirs + logging)
+# ---------------------------------------------------------------------------
+DISCOGS_API_BASE = "https://api.discogs.com"
+APP_VERSION = "v1.3.0"
+DISCOGS_USER_AGENT = (
+    f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
+)
+
+_boot_settings = load_settings()
+BASE_DIR = Path(_boot_settings.get("base_dir", str(DEFAULT_BASE_DIR))).expanduser()
+DIRS = ensure_base_dirs(BASE_DIR)
+_boot_settings["base_dir"] = str(BASE_DIR)
+save_settings(_boot_settings)
+
+log_file = setup_logging(log_root=str(DIRS["logs"]))
+logger = get_logger(__name__)
+logger.info("discogs_to_shopify_gui.py started. Log file: %s", log_file)
 
 
 def persist_discogs_token_to_env(token: str) -> None:
@@ -608,7 +790,17 @@ def persist_discogs_token_to_env(token: str) -> None:
         except Exception as e:
             logger.warning("Failed to persist Discogs token with setx: %s", e)
 
-
+def clean_price(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("$", "").replace(",", "")
+    try:
+        return float(s)
+    except:
+        return None
+  
 # ---------------------------------------------------------------------------
 # Row processing
 # ---------------------------------------------------------------------------
@@ -653,6 +845,9 @@ def make_shopify_rows_for_record(
     format_desc = build_format_description(release_details)
     tracklist_html = build_tracklist_html(release_details)
     shop_signage = simple_shop_signage(genre, styles)
+    inventory_date = normalize_inventory_date(
+        input_row.get("Inventory Date") or input_row.get("inventory_date")
+    )
 
     discogs_release_id = release_details.get("id")
     discogs_url = (
@@ -661,7 +856,28 @@ def make_shopify_rows_for_record(
         else ""
     )
 
-    # --- Weight estimation ---
+    # --- Weight
+    # --- Barcode / SKU ---
+    discogs_barcode: Optional[str] = None
+    for ident in release_details.get("identifiers") or []:
+        id_type = str(ident.get("type", "")).strip().lower()
+        if id_type == "barcode":
+            val = str(ident.get("value", "")).strip()
+            if val:
+                discogs_barcode = val
+                break
+
+    # Pull SKU from input if present
+    sku_raw = (
+        input_row.get("SKU")
+        or input_row.get("Sku")
+        or input_row.get("sku")
+        or input_row.get("Variant SKU")
+        or ""
+    )
+    sku = str(sku_raw).strip()
+
+    # Weight estimation
     grams = calculate_weight_grams_from_formats(release_details)
     pounds = grams_to_pounds(grams)
 
@@ -691,6 +907,15 @@ def make_shopify_rows_for_record(
 
     logger.info("Discogs HIGH marketplace price: %s", discogs_high_price)
 
+    # --- Discogs price suggestions (condition-based) ---
+    price_suggestions = release_details.get("_price_suggestions") or {}
+    discogs_suggested_price = discogs_price_from_suggestions(media_cond, price_suggestions)
+    logger.info(
+        "Discogs price suggestion (media=%s): %s",
+        media_cond,
+        discogs_suggested_price,
+    )
+
     # --- eBay SOLD and ACTIVE listings for pricing ---
     # Temporarily disabled due to eBay API token/scope issues.
     # We keep the structure and types so the pricing engine still works,
@@ -707,10 +932,12 @@ def make_shopify_rows_for_record(
     ctx = pricing.PricingContext(
         format_type=format_desc or (str(input_row.get(COL_TYPE, "")).strip() or "LP"),
         media_condition=media_cond,
-        reference_price=float(price_str) if price_str else None,
+        reference_price=clean_price(price_str),
+        discogs_suggested=discogs_suggested_price,
+        discogs_high=discogs_high_price,
         discogs_median=None,
         discogs_last=None,
-        discogs_low=discogs_high_price,  # using HIGH as the discogs_low input intentionally
+        discogs_low=None,
         comparable_price=None,
         ebay_sold=ebay_sold_listings,
         ebay_active=ebay_active_listings,
@@ -731,18 +958,15 @@ def make_shopify_rows_for_record(
         handle = f"{base_handle}-{handle_registry[base_handle]}"
 
     # ------------------------------------------------------------
-    # Main cover image: prefer release details, fall back to search
-    # Then apply STOCK PHOTO watermark, saving to a local cache path.
+    # Main cover image: prefer release details, fall back to search.
+    # We now **do not** watermark; we keep the Discogs URL as-is and
+    # flag it via product.metafields.custom.uses_stock_photo.
     # ------------------------------------------------------------
     primary_image_url = extract_primary_image_url(release_details)
     if not primary_image_url:
         primary_image_url = extract_primary_image_url(release_search_obj or {})
 
-    if primary_image_url:
-        primary_image_url = apply_watermarked_cover(
-            primary_image_url,  # original Discogs URL
-            base_handle,        # used to build unique filename
-        )
+    uses_stock_photo_value = "TRUE" if primary_image_url else "FALSE"
 
     tags = build_tags(genre, styles, year, label, format_desc)
 
@@ -825,8 +1049,8 @@ def make_shopify_rows_for_record(
         "Variant Price": price_str_out,
         "Variant Compare At Price": "",
         "Cost per item": "",
-        "Variant SKU": "",
-        "Variant Barcode": "",
+        "Variant SKU": sku,
+        "Variant Barcode": discogs_barcode or sku,
         "Variant Inventory Tracker": "shopify",
         "Variant Inventory Policy": "deny",
         "Variant Inventory Qty": 1,
@@ -848,11 +1072,14 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.album_condition": album_condition_value,
         "product.metafields.custom.condition": condition_summary,
         "product.metafields.custom.condition_description": condition_description_value,
+        "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
+        "product.metafields.custom.inventory_date": inventory_date,
         # Misprint diagnostics
         "Label_Misprint_Suspected": "TRUE" if mis_suspected else "FALSE",
         "Label_Misprint_Reasons": mis_reasons,
         # OCR / label diagnostics
         "Ocr_Catalog": input_row.get("Ocr_Catalog", ""),
+        "Ocr_Matrix": input_row.get("Ocr_Matrix", ""),
         "Ocr_Label": input_row.get("Ocr_Label", ""),
         "Ocr_Year": input_row.get("Ocr_Year", ""),
         "Ocr_StereoMono": input_row.get("Ocr_StereoMono", ""),
@@ -882,6 +1109,8 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.album_condition": album_condition_value,
         "product.metafields.custom.condition": condition_summary,
         "product.metafields.custom.condition_description": condition_description_value,
+        "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
+        "product.metafields.custom.inventory_date": inventory_date,
     }
 
     return rows, metafield_row
@@ -916,10 +1145,11 @@ def process_file(
     matched_rows: List[Dict[str, Any]] = []
     unmatched_rows: List[Dict[str, Any]] = []
     metafield_rows: List[Dict[str, Any]] = []
+    retry_rows: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
 
     handle_registry: Dict[str, int] = {}
 
-    for idx, row in enumerate(records, start=1):
+    def process_single_row(idx: int, row: Dict[str, Any], allow_retry: bool = True) -> None:
         artist = str(row.get(COL_ARTIST, "")).strip()
         title = str(row.get(COL_TITLE, "")).strip()
         country = str(row.get(COL_COUNTRY, "")).strip() or None
@@ -944,7 +1174,7 @@ def process_file(
             )
             if progress_callback:
                 progress_callback(idx, total_rows)
-            continue
+            return
 
         meta: Dict[str, Any] = {
             "Artist": artist,
@@ -977,45 +1207,67 @@ def process_file(
         logger.info("Row %d: searching Discogs for %s", idx, enriched_query)
 
         # Catalog numbers from sheet vs OCR
-        catalog_sheet = (meta.get("Catalog Number") or catalog) or None
-        catalog_ocr = (
+        catalog_sheet_raw = (meta.get("Catalog Number") or catalog) or None
+        catalog_ocr_raw = (
             meta.get("Label_Catalog_Number")
             or meta.get("Ocr_Catalog")
             or None
         )
 
-        # ------------------------------------------------------------------
-        # FIRST ATTEMPT: normal search (sheet catalog first, then fallback)
-        # ------------------------------------------------------------------
-        primary_cat = catalog_sheet or catalog_ocr
+        # Basic sanity cleanup: drop pure-year "catnos" like "1969"
+        catalog_sheet = sanitize_catalog_for_search(catalog_sheet_raw)
+        catalog_ocr = sanitize_catalog_for_search(catalog_ocr_raw)
 
+        # ------------------------------------------------------------------
+        # FIRST ATTEMPT: *loose* search – artist + title (+ country).
+        # Do NOT filter by catalog or year here; that over-constrains things
+        # and can break cases where spreadsheet/OCR year or catalog are off.
+        # ------------------------------------------------------------------
         search_obj = discogs_search_release(
             discogs_token,
             artist,
             title,
             country,
-            primary_cat,
-            year_val,
+            None,   # no catalog filter
+            None,   # no year filter
         )
 
         # ------------------------------------------------------------------
-        # SECOND ATTEMPT: if no result but we DO have an OCR catalog,
-        # retry with OCR catalog only, and relax country/year.
+        # SECOND ATTEMPT: if no result and we DO have an OCR catalog,
+        # retry with OCR catalog, relaxing country/year.
         # ------------------------------------------------------------------
-        if not search_obj and catalog_ocr and catalog_ocr != catalog_sheet:
+        if not search_obj and catalog_ocr:
             logger.info(
                 "Row %d: no match on primary search; retrying with OCR catalog only: %s",
                 idx,
                 catalog_ocr,
             )
-
             search_obj = discogs_search_release(
                 discogs_token,
                 artist,
                 title,
-                None,         # relax country
-                catalog_ocr,  # trust OCR catalog
-                None,         # relax year
+                None,          # relax country
+                catalog_ocr,   # OCR-derived catalog
+                None,          # relax year
+            )
+
+        # ------------------------------------------------------------------
+        # THIRD ATTEMPT: if still no result, try the sheet catalog only
+        # (if it's different from the OCR catalog).
+        # ------------------------------------------------------------------
+        if not search_obj and catalog_sheet and catalog_sheet != catalog_ocr:
+            logger.info(
+                "Row %d: still no result; retrying with sheet catalog only: %s",
+                idx,
+                catalog_sheet,
+            )
+            search_obj = discogs_search_release(
+                discogs_token,
+                artist,
+                title,
+                None,          # relax country
+                catalog_sheet, # sheet-derived catalog
+                None,          # relax year
             )
 
         if not search_obj:
@@ -1030,7 +1282,7 @@ def process_file(
             )
             if progress_callback:
                 progress_callback(idx, total_rows)
-            continue
+            return
 
         release_id = search_obj.get("id")
         if not release_id:
@@ -1046,29 +1298,41 @@ def process_file(
             )
             if progress_callback:
                 progress_callback(idx, total_rows)
-            continue
+            return
+
+        # brief pause to ease rate limits
+        time.sleep(0.2)
 
         details = discogs_get_release_details(discogs_token, release_id)
         if not details:
             logger.warning(
-                "Could not fetch details for release %s (row %d); skipping.",
+                "Could not fetch details for release %s (row %d).",
                 release_id,
                 idx,
             )
-            unmatched_rows.append(
-                {
-                    "Reason": f"Failed to fetch Discogs release details for ID {release_id}",
-                    "Discogs_Query_Used": enriched_query,
-                    **row,
-                }
-            )
+            if allow_retry:
+                retry_rows.append((idx, row, enriched_query))
+            else:
+                unmatched_rows.append(
+                    {
+                        "Reason": f"Failed to fetch Discogs release details for ID {release_id}",
+                        "Discogs_Query_Used": enriched_query,
+                        **row,
+                    }
+                )
             if progress_callback:
                 progress_callback(idx, total_rows)
-            continue
+            return
 
         market_stats = discogs_get_marketplace_stats(discogs_token, release_id)
         if market_stats:
             details["_marketplace_stats"] = market_stats
+
+        price_suggestions = discogs_client.get_price_suggestions(
+            discogs_token, release_id
+        )
+        if price_suggestions:
+            details["_price_suggestions"] = price_suggestions
 
         misprint_info = detect_label_misprint(meta, details)
 
@@ -1087,11 +1351,23 @@ def process_file(
         if progress_callback:
             progress_callback(idx, total_rows)
 
+    # First pass
+    for idx, row in enumerate(records, start=1):
+        process_single_row(idx, row, allow_retry=True)
+
+    # Second pass for rows that failed Discogs details
+    if retry_rows:
+        logger.info("Retrying %d rows with extended backoff after initial failures...", len(retry_rows))
+        time.sleep(2.0)
+        for idx, row, _enriched_query in retry_rows:
+            process_single_row(idx, row, allow_retry=False)
+
     # Write matched CSV (products)
     if matched_rows:
         logger.info("Writing matched output CSV (products): %s", output_matched)
         with output_matched.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(matched_rows[0].keys()))
+            fieldnames = sorted({k for r in matched_rows for k in r.keys()})
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in matched_rows:
                 writer.writerow(r)
@@ -1102,7 +1378,7 @@ def process_file(
     if unmatched_rows:
         logger.info("Writing unmatched output CSV: %s", output_not_matched)
         with output_not_matched.open("w", newline="", encoding="utf-8") as f:
-            fieldnames = list(unmatched_rows[0].keys())
+            fieldnames = sorted({k for r in unmatched_rows for k in r.keys()})
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in unmatched_rows:
@@ -1129,8 +1405,9 @@ def process_file(
 
 def run_gui() -> None:
     """
-    Run a very simple Tkinter-based GUI to pick input file, token, and run
-    the processing pipeline.
+    Run a Tkinter-based GUI to pick input file, token, and run the processing
+    pipeline. Files default to the app's base folder tree so users don't have
+    to browse each time.
     """
     import tkinter as tk
     from tkinter import filedialog, ttk, scrolledtext, messagebox
@@ -1138,7 +1415,7 @@ def run_gui() -> None:
     print_run_banner()
 
     root = tk.Tk()
-    root.title(f"Discogs → Shopify Vinyl Import ({APP_VERSION})")
+    root.title(f"Discogs -> Shopify Vinyl Import ({APP_VERSION})")
 
     settings = load_settings()
 
@@ -1147,14 +1424,92 @@ def run_gui() -> None:
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
-    # Input file selection
-    input_path_var = tk.StringVar(value=settings.get("last_input_path", ""))
+    base_dir_var = tk.StringVar(value=str(BASE_DIR))
+
+    last_outputs: Dict[str, Optional[Path]] = {
+        "matched": None,
+        "not_matched": None,
+        "metafields": None,
+        "log": Path(log_file),
+    }
+
+    def pick_first_input() -> str:
+        for pattern in ("*.xlsx", "*.xls", "*.csv"):
+            files = sorted(DIRS["input"].glob(pattern))
+            if files:
+                return str(files[0])
+        return ""
+
+    input_path_var = tk.StringVar(
+        value=settings.get("last_input_path", "") or pick_first_input()
+    )
     token_var = tk.StringVar(
         value=settings.get("last_discogs_token", os.getenv("DISCOGS_TOKEN", ""))
     )
 
+    header = ttk.Frame(mainframe)
+    header.grid(row=0, column=0, columnspan=3, sticky="WE", pady=(0, 8))
+    header.columnconfigure(1, weight=1)
+    ttk.Label(header, text="Base folder:").grid(row=0, column=0, sticky="W")
+    ttk.Label(header, textvariable=base_dir_var).grid(row=0, column=1, sticky="W")
+
+    def open_settings_dialog() -> None:
+        dlg = tk.Toplevel(root)
+        dlg.title("Settings")
+        dlg.grab_set()
+
+        new_base_var = tk.StringVar(value=base_dir_var.get())
+        ttk.Label(dlg, text="Base folder for input/output/logs:").grid(
+            row=0, column=0, sticky="W", padx=8, pady=(8, 2)
+        )
+        ttk.Entry(dlg, width=60, textvariable=new_base_var).grid(
+            row=1, column=0, padx=8, pady=2, sticky="WE"
+        )
+
+        def browse_base() -> None:
+            path = filedialog.askdirectory(
+                title="Select base folder", initialdir=new_base_var.get()
+            )
+            if path:
+                new_base_var.set(path)
+
+        ttk.Button(dlg, text="Browse", command=browse_base).grid(
+            row=1, column=1, padx=4, pady=2, sticky="W"
+        )
+
+        def save_base() -> None:
+            nonlocal settings
+            new_base = Path(new_base_var.get()).expanduser()
+            ensure_base_dirs(new_base)
+            settings["base_dir"] = str(new_base)
+            save_settings(settings)
+            base_dir_var.set(str(new_base))
+            globals()["BASE_DIR"] = new_base
+            globals()["DIRS"] = ensure_base_dirs(new_base)
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Save", command=save_base).grid(
+            row=2, column=0, padx=8, pady=8, sticky="W"
+        )
+        ttk.Button(dlg, text="Cancel", command=dlg.destroy).grid(
+            row=2, column=1, padx=4, pady=8, sticky="E"
+        )
+
+    ttk.Button(header, text="Settings", command=open_settings_dialog).grid(
+        row=0, column=2, sticky="E"
+    )
+
+    ttk.Label(
+        mainframe,
+        text=(
+            f"Place inventory files in {DIRS['input']}.\n"
+            'Outputs and logs will be written under the base folder automatically.'
+        ),
+    ).grid(row=1, column=0, columnspan=3, sticky="W", pady=(0, 6))
+
     def browse_input() -> None:
         path = filedialog.askopenfilename(
+            initialdir=str(DIRS["input"]),
             title="Select inventory file",
             filetypes=[
                 ("Spreadsheet files", "*.xlsx *.xls *.csv"),
@@ -1165,50 +1520,34 @@ def run_gui() -> None:
             input_path_var.set(path)
 
     ttk.Label(mainframe, text="Input inventory file:").grid(
-        row=0, column=0, sticky="W"
-    )
-    input_entry = ttk.Entry(mainframe, width=60, textvariable=input_path_var)
-    input_entry.grid(row=0, column=1, sticky="WE")
-    ttk.Button(mainframe, text="Browse…", command=browse_input).grid(
-        row=0, column=2, sticky="W"
-    )
-
-    # Discogs token
-    ttk.Label(mainframe, text="Discogs token:").grid(row=1, column=0, sticky="W")
-    token_entry = ttk.Entry(mainframe, width=40, textvariable=token_var, show="*")
-    token_entry.grid(row=1, column=1, sticky="WE")
-
-    # Output directory (optional – default is same as input)
-    output_dir_var = tk.StringVar(value=settings.get("last_output_dir", ""))
-
-    def browse_output_dir() -> None:
-        path = filedialog.askdirectory(title="Select output directory")
-        if path:
-            output_dir_var.set(path)
-
-    ttk.Label(mainframe, text="Output directory (optional):").grid(
         row=2, column=0, sticky="W"
     )
-    out_entry = ttk.Entry(mainframe, width=60, textvariable=output_dir_var)
-    out_entry.grid(row=2, column=1, sticky="WE")
-    ttk.Button(mainframe, text="Browse…", command=browse_output_dir).grid(
+    ttk.Entry(mainframe, width=60, textvariable=input_path_var).grid(
+        row=2, column=1, sticky="WE"
+    )
+    ttk.Button(mainframe, text="Browse", command=browse_input).grid(
         row=2, column=2, sticky="W"
     )
+    ttk.Button(mainframe, text="Open input folder", command=lambda: open_path(DIRS["input"])).grid(
+        row=3, column=0, sticky="W", pady=(2, 8)
+    )
 
-    # Progress bar
+    ttk.Label(mainframe, text="Discogs token:").grid(row=4, column=0, sticky="W")
+    ttk.Entry(mainframe, width=40, textvariable=token_var, show="*").grid(
+        row=4, column=1, sticky="WE"
+    )
+
     progress = ttk.Progressbar(
         mainframe, orient="horizontal", mode="determinate"
     )
-    progress.grid(row=3, column=0, columnspan=3, sticky="WE", pady=(8, 4))
+    progress.grid(row=5, column=0, columnspan=3, sticky="WE", pady=(8, 4))
 
-    # Log window
     log_text = scrolledtext.ScrolledText(
         mainframe, width=80, height=20, state="disabled"
     )
-    log_text.grid(row=4, column=0, columnspan=3, sticky="NSEW")
-    mainframe.rowconfigure(4, weight=1)
+    log_text.grid(row=6, column=0, columnspan=3, sticky="NSEW")
+    mainframe.rowconfigure(6, weight=1)
 
-    # Redirect logging to the Tkinter text widget as well
     class TextHandler(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
             msg = self.format(record)
@@ -1223,7 +1562,34 @@ def run_gui() -> None:
     )
     logging.getLogger().addHandler(handler)
 
-    # Start button
+    output_msg_var = tk.StringVar(value="")
+
+    def open_matched() -> None:
+        if last_outputs["matched"]:
+            open_path(last_outputs["matched"])
+
+    def open_output_folder() -> None:
+        open_path(DIRS["output"])
+
+    def open_logs_folder() -> None:
+        open_path(DIRS["logs"])
+
+    buttons_frame = ttk.Frame(mainframe)
+    buttons_frame.grid(row=8, column=0, columnspan=3, sticky="WE", pady=(6, 0))
+    ttk.Button(buttons_frame, text="Open matched CSV", command=open_matched).grid(
+        row=0, column=0, padx=4, sticky="W"
+    )
+    ttk.Button(buttons_frame, text="Open output folder", command=open_output_folder).grid(
+        row=0, column=1, padx=4, sticky="W"
+    )
+    ttk.Button(buttons_frame, text="Open logs folder", command=open_logs_folder).grid(
+        row=0, column=2, padx=4, sticky="W"
+    )
+
+    ttk.Label(mainframe, textvariable=output_msg_var).grid(
+        row=7, column=0, columnspan=3, sticky="W", pady=(4, 0)
+    )
+
     def start_processing() -> None:
         input_path_str = input_path_var.get().strip()
         token_str = token_var.get().strip()
@@ -1242,27 +1608,25 @@ def run_gui() -> None:
             )
             return
 
-        # Save settings
-        new_settings = {
-            "last_input_path": input_path_str,
-            "last_discogs_token": token_str,
-            "last_output_dir": output_dir_var.get().strip(),
-        }
-        save_settings(new_settings)
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        settings.update(
+            {
+                "last_input_path": input_path_str,
+                "last_discogs_token": token_str,
+            }
+        )
+        save_settings(settings)
         persist_discogs_token_to_env(token_str)
 
-        # Determine output paths
-        out_dir = (
-            Path(output_dir_var.get().strip())
-            if output_dir_var.get().strip()
-            else input_path.parent
+        output_matched = DIRS["output"] / (
+            input_path.stem + f"_Output for matched records_Completed_{ts}.csv"
         )
-        output_matched = out_dir / (
-            input_path.stem + "_Output for matched records.csv"
+        output_not_matched = DIRS["output"] / (
+            input_path.stem + f"_Not_Matched_Completed_{ts}.csv"
         )
-        output_not_matched = out_dir / (input_path.stem + "_Not_Matched.csv")
-        output_metafields = out_dir / (
-            input_path.stem + "_Metafields for matched records.csv"
+        output_metafields = DIRS["output"] / (
+            input_path.stem + f"_Metafields for matched records_Completed_{ts}.csv"
         )
 
         logger.info("Input file: %s", input_path)
@@ -1293,6 +1657,28 @@ def run_gui() -> None:
             messagebox.showerror("Error", f"An error occurred:\n{e}")
             return
 
+        try:
+            dest = DIRS["processed"] / (
+                input_path.stem + f"_Processed_{ts}{input_path.suffix}"
+            )
+            shutil.move(str(input_path), dest)
+            logger.info("Moved processed input to %s", dest)
+        except Exception as e:
+            logger.warning("Could not move processed input: %s", e)
+
+        last_outputs["matched"] = output_matched
+        last_outputs["not_matched"] = output_not_matched
+        last_outputs["metafields"] = output_metafields
+
+        msg = (
+            "Processing complete.\n"
+            f"Matched: {output_matched}\n"
+            f"Not matched: {output_not_matched}\n"
+            f"Metafields: {output_metafields}\n"
+            f"Logs: {DIRS['logs']}\n"
+        )
+        output_msg_var.set(msg)
+
         logger.info("\nDone.")
         messagebox.showinfo(
             "Complete",
@@ -1304,7 +1690,7 @@ def run_gui() -> None:
         )
 
     ttk.Button(mainframe, text="Start", command=start_processing).grid(
-        row=5, column=0, columnspan=3, pady=(8, 4)
+        row=9, column=0, columnspan=3, pady=(8, 4)
     )
 
     root.mainloop()
@@ -1359,7 +1745,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 1
 
-    out_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+    out_dir = Path(args.output_dir) if args.output_dir else DIRS["output"]
     output_matched = out_dir / (
         input_path.stem + "_Output for matched records.csv"
     )
@@ -1385,3 +1771,5 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

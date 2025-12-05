@@ -10,6 +10,16 @@ The format is:
 
 ---
 
+## v1.3.0 — 2025-12-04
+
+- GUI/paths: default base folder under Documents/UnusualFindsAlbumApp with fixed input/output/logs/cache, timestamped outputs, processed input moves to `input/processed/`, quick-open buttons, and settings gear to change the base.
+- Metafields: added `product.metafields.custom.inventory_date` normalized to YYYY-MM-DD.
+- OCR: added matrix/runout token extraction from label OCR and include it as a Discogs search hint.
+- Pricing: Discogs price suggestions wired as condition-based fallback (`DSUG`); reference price can override lower computed prices; CSV writers use unioned fieldnames to avoid header mismatches.
+- Discogs resilience: longer timeouts/backoff, small per-call delays, and a second retry pass for release details to reduce skips under throttle/latency.
+
+---
+
 ## v1.0.0 â€“ 2025-11-23
 
 - Created the first tracked version of `discogs_to_shopify.py`.
