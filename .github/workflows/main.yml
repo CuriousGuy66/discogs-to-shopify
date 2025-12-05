@@ -39,16 +39,15 @@ jobs:
             pip install pandas requests python-slugify openpyxl
           fi
 
-      - name: Run Discogs → Shopify script
+      - name: Run Discogs to Shopify script
         env:
           DISCOGS_TOKEN: ${{ secrets.DISCOGS_TOKEN }}
         run: |
           mkdir -p output
-          python discogs_to_shopify_v1_1_1.py \
+          python discogs_to_shopify_gui.py \
             input/input.xlsx \
-            output/output.csv \
-            --token "$DISCOGS_TOKEN" \
-            --log-level INFO
+            --discogs-token "$DISCOGS_TOKEN" \
+            --output-dir output
 
       - name: List output files (debug)
         run: |
@@ -60,6 +59,6 @@ jobs:
         with:
           name: shopify-output
           path: |
-            output/output.csv
-            output/output_unmatched.csv
-
+            output/*Output for matched records.csv
+            output/*Not_Matched.csv
+            output/*Metafields for matched records.csv
