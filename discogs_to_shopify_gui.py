@@ -487,6 +487,86 @@ def normalize_inventory_date(value: Any) -> str:
         return today
 
 
+def _looks_like_person(name: str) -> bool:
+    """
+    Heuristic: treat as person if 2-4 tokens and no band/orchestra keywords.
+    """
+    if not name:
+        return False
+    n_upper = name.upper()
+    band_keywords = [
+        "&",
+        " AND ",
+        "BAND",
+        "ORCHESTRA",
+        "PHILHARMONIC",
+        "SYMPHONY",
+        "ENSEMBLE",
+        "CHOIR",
+        "CHORUS",
+        "QUARTET",
+        "TRIO",
+        "DUO",
+        "COMPANY",
+        "PLAYERS",
+        "SINGERS",
+    ]
+    for kw in band_keywords:
+        if kw in n_upper:
+            return False
+    tokens = [t for t in name.strip().split() if t]
+    return 2 <= len(tokens) <= 4
+
+
+def format_person_name(name: str) -> str:
+    """
+    Flip 'First Middle Last' -> 'Last, First Middle'. Preserve existing commas.
+    """
+    if not name:
+        return name
+    if "," in name:
+        return name.strip()
+    parts = [p for p in name.strip().split() if p]
+    if len(parts) < 2:
+        return name.strip()
+    last = parts[-1]
+    first_middle = " ".join(parts[:-1])
+    return f"{last}, {first_middle}"
+
+
+def extract_composer(release_details: Dict[str, Any]) -> Optional[str]:
+    """
+    Attempt to pull a composer from Discogs extraartists with role containing 'Composed'.
+    """
+    extras = release_details.get("extraartists") or []
+    for ex in extras:
+        role = str(ex.get("role", "")).lower()
+        name = str(ex.get("name", "")).strip()
+        if "composed" in role and name:
+            return name
+    return None
+
+
+def build_shop_artist(artist_name: str, release_details: Dict[str, Any]) -> str:
+    """
+    Compute Shop_Artist:
+      - For orchestras/conductors, prefer composer if available.
+      - For apparent persons, flip to Last, First Middle.
+      - For bands/groups, leave as-is (but still normalized 'The X' later if desired).
+    """
+    composer = extract_composer(release_details)
+    upper_artist = artist_name.upper()
+    orchestra_words = ["ORCHESTRA", "PHILHARMONIC", "SYMPHONY", "CONDUCTOR"]
+
+    if composer and any(w in upper_artist for w in orchestra_words):
+        return composer
+
+    if _looks_like_person(artist_name):
+        return format_person_name(artist_name)
+
+    return artist_name.strip()
+
+
 def normalize_discogs_suggestion_key(key: str) -> Optional[str]:
     """
     Map Discogs price suggestion condition labels to our normalized ladder.
@@ -812,7 +892,7 @@ def make_shopify_rows_for_record(
     release_details: Dict[str, Any],
     misprint_info: Optional[Dict[str, Any]],
     handle_registry: Dict[str, int],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float, Optional[float]]:
     """
     Build one or more Shopify rows (main product + optional image-only row)
     for a single matched Discogs release.
@@ -947,6 +1027,7 @@ def make_shopify_rows_for_record(
     pricing_result = pricing.compute_price(ctx)
     price = pricing_result.final_price
     price_str_out = f"{price:.2f}"
+    ref_price_val = clean_price(price_str)
 
     # Unique handle
     base_handle = slugify_handle(f"{artist_display} {title} {year}".strip())
@@ -962,11 +1043,33 @@ def make_shopify_rows_for_record(
     # We now **do not** watermark; we keep the Discogs URL as-is and
     # flag it via product.metafields.custom.uses_stock_photo.
     # ------------------------------------------------------------
-    primary_image_url = extract_primary_image_url(release_details)
-    if not primary_image_url:
-        primary_image_url = extract_primary_image_url(release_search_obj or {})
+    discogs_cover_url = extract_primary_image_url(release_details)
+    if not discogs_cover_url:
+        discogs_cover_url = extract_primary_image_url(release_search_obj or {})
 
-    uses_stock_photo_value = "TRUE" if primary_image_url else "FALSE"
+    # Sleeve in poor/fair condition? Prefer the label photo as primary to avoid a pristine stock image.
+    sleeve_upper = sleeve_cond.upper()
+    sleeve_is_poor = any(
+        token in sleeve_upper for token in ["POOR", "FAIR", "F/P", "(P)", "(F)"]
+    )
+
+    primary_image_url = discogs_cover_url
+    additional_images: List[str] = []
+
+    if sleeve_is_poor and center_label_photo:
+        primary_image_url = center_label_photo
+        if discogs_cover_url:
+            additional_images.append(discogs_cover_url)
+        uses_stock_photo_value = "FALSE"
+    else:
+        # Default: use Discogs cover if available; otherwise center label if present.
+        if not primary_image_url and center_label_photo:
+            primary_image_url = center_label_photo
+        elif primary_image_url and center_label_photo:
+            additional_images.append(center_label_photo)
+        uses_stock_photo_value = "TRUE" if primary_image_url == discogs_cover_url else "FALSE"
+
+    shop_artist = build_shop_artist(artist_display, release_details)
 
     tags = build_tags(genre, styles, year, label, format_desc)
 
@@ -1073,6 +1176,7 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.condition": condition_summary,
         "product.metafields.custom.condition_description": condition_description_value,
         "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
+        "product.metafields.custom.shop_artist": shop_artist,
         "product.metafields.custom.inventory_date": inventory_date,
         # Misprint diagnostics
         "Label_Misprint_Suspected": "TRUE" if mis_suspected else "FALSE",
@@ -1092,14 +1196,18 @@ def make_shopify_rows_for_record(
 
     rows: List[Dict[str, Any]] = [row]
 
-    # If we have a center label photo, create a second "image-only" row
-    if center_label_photo:
+    # Additional image rows
+    pos = 2
+    for img in additional_images:
+        if not img:
+            continue
         img_row = {k: "" for k in row.keys()}
         img_row["Handle"] = handle
-        img_row["Image Src"] = center_label_photo
-        img_row["Image Position"] = 2  # keep cover as position 1
+        img_row["Image Src"] = img
+        img_row["Image Position"] = pos
         img_row["Image Alt Text"] = full_title
         rows.append(img_row)
+        pos += 1
 
     # Metafield-only row for the metafields CSV
     metafield_row: Dict[str, Any] = {
@@ -1110,10 +1218,11 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.condition": condition_summary,
         "product.metafields.custom.condition_description": condition_description_value,
         "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
+        "product.metafields.custom.shop_artist": shop_artist,
         "product.metafields.custom.inventory_date": inventory_date,
     }
 
-    return rows, metafield_row
+    return rows, metafield_row, price, ref_price_val
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +1237,7 @@ def process_file(
     output_not_matched: Path,
     output_metafields: Path,
     progress_callback: Optional[Callable[[int, int], None]] = None,
-) -> None:
+) -> Dict[str, Any]:
     """
     Load the input CSV/XLSX, process each row, and write output CSVs.
     """
@@ -1146,10 +1255,13 @@ def process_file(
     unmatched_rows: List[Dict[str, Any]] = []
     metafield_rows: List[Dict[str, Any]] = []
     retry_rows: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+    total_final_price = 0.0
+    total_reference_price = 0.0
 
     handle_registry: Dict[str, int] = {}
 
     def process_single_row(idx: int, row: Dict[str, Any], allow_retry: bool = True) -> None:
+        nonlocal total_final_price, total_reference_price
         artist = str(row.get(COL_ARTIST, "")).strip()
         title = str(row.get(COL_TITLE, "")).strip()
         country = str(row.get(COL_COUNTRY, "")).strip() or None
@@ -1338,7 +1450,7 @@ def process_file(
 
         logger.info("Matched row %d to Discogs release %s", idx, release_id)
 
-        shopify_rows, metafield_row = make_shopify_rows_for_record(
+        shopify_rows, metafield_row, final_price_val, ref_price_val = make_shopify_rows_for_record(
             row,
             search_obj,
             details,
@@ -1347,6 +1459,9 @@ def process_file(
         )
         matched_rows.extend(shopify_rows)
         metafield_rows.append(metafield_row)
+        total_final_price += float(final_price_val or 0.0)
+        if ref_price_val is not None:
+            total_reference_price += float(ref_price_val)
 
         if progress_callback:
             progress_callback(idx, total_rows)
@@ -1386,6 +1501,25 @@ def process_file(
     else:
         logger.info("No unmatched rows; not writing unmatched CSV.")
 
+    summary = {
+        "total_rows": total_rows,
+        "matched_count": len(metafield_rows),
+        "unmatched_count": len(unmatched_rows),
+        "total_final_price": round(total_final_price, 2),
+        "total_reference_price": round(total_reference_price, 2),
+        "price_diff": round(total_final_price - total_reference_price, 2),
+    }
+    logger.info(
+        "Summary: total=%s matched=%s unmatched=%s final_sum=%.2f ref_sum=%.2f diff=%.2f",
+        summary["total_rows"],
+        summary["matched_count"],
+        summary["unmatched_count"],
+        summary["total_final_price"],
+        summary["total_reference_price"],
+        summary["price_diff"],
+    )
+
+    return summary
     # Write metafields CSV
     if metafield_rows:
         logger.info("Writing metafields output CSV: %s", output_metafields)
@@ -1548,6 +1682,11 @@ def run_gui() -> None:
     log_text.grid(row=6, column=0, columnspan=3, sticky="NSEW")
     mainframe.rowconfigure(6, weight=1)
 
+    def clear_log_window() -> None:
+        log_text.configure(state="normal")
+        log_text.delete("1.0", tk.END)
+        log_text.configure(state="disabled")
+
     class TextHandler(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
             msg = self.format(record)
@@ -1593,6 +1732,8 @@ def run_gui() -> None:
     def start_processing() -> None:
         input_path_str = input_path_var.get().strip()
         token_str = token_var.get().strip()
+
+        clear_log_window()
 
         if not input_path_str:
             messagebox.showerror("Error", "Please select an input file.")
@@ -1644,7 +1785,7 @@ def run_gui() -> None:
                 root.update_idletasks()
 
         try:
-            process_file(
+            summary = process_file(
                 input_path=input_path,
                 discogs_token=token_str,
                 output_matched=output_matched,
@@ -1675,6 +1816,11 @@ def run_gui() -> None:
             f"Matched: {output_matched}\n"
             f"Not matched: {output_not_matched}\n"
             f"Metafields: {output_metafields}\n"
+            f"Totals: processed={summary['total_rows']}, matched={summary['matched_count']}, "
+            f"unmatched={summary['unmatched_count']}, "
+            f"final_sum=${summary['total_final_price']:.2f}, "
+            f"ref_sum=${summary['total_reference_price']:.2f}, "
+            f"diff=${summary['price_diff']:.2f}\n"
             f"Logs: {DIRS['logs']}\n"
         )
         output_msg_var.set(msg)
@@ -1686,7 +1832,14 @@ def run_gui() -> None:
             "Files created:\n"
             f"  - {output_matched.name}\n"
             f"  - {output_not_matched.name}\n"
-            f"  - {output_metafields.name}\n",
+            f"  - {output_metafields.name}\n\n"
+            "Summary:\n"
+            f"  Processed: {summary['total_rows']}\n"
+            f"  Matched: {summary['matched_count']}\n"
+            f"  Unmatched: {summary['unmatched_count']}\n"
+            f"  Final sum: ${summary['total_final_price']:.2f}\n"
+            f"  Ref sum: ${summary['total_reference_price']:.2f}\n"
+            f"  Difference: ${summary['price_diff']:.2f}\n",
         )
 
     ttk.Button(mainframe, text="Start", command=start_processing).grid(
@@ -1756,7 +1909,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print_run_banner()
 
-    process_file(
+    summary = process_file(
         input_path=input_path,
         discogs_token=token,
         output_matched=output_matched,
@@ -1766,6 +1919,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     print("Done.")
+    print(
+        f"Summary: total={summary['total_rows']} matched={summary['matched_count']} "
+        f"unmatched={summary['unmatched_count']} final_sum={summary['total_final_price']:.2f} "
+        f"ref_sum={summary['total_reference_price']:.2f} diff={summary['price_diff']:.2f}"
+    )
     return 0
 
 

@@ -2,4 +2,7 @@ pandas
 requests
 python-slugify
 openpyxl
+xlrd
+pillow
+pytesseract
 pyinstaller
