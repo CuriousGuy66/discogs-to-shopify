@@ -9,6 +9,7 @@ Center-label OCR helper for Unusual Finds vinyl workflow.
 - Runs OCR tuned for vinyl center labels (crop, upscale, threshold)
 - Extracts:
     Ocr_Catalog
+    Ocr_Matrix
     Ocr_Label
     Ocr_Year
     Ocr_StereoMono
@@ -81,6 +82,8 @@ LABEL_OCR_ENABLED = False  # <-- set to True when you're ready to re-enable
 YEAR_PATTERN = re.compile(
     r"\b(19[5-9]\d|20[0-4]\d)\b"  # 1950–2049
 )
+
+MATRIX_TOKEN = re.compile(r"[A-Z0-9][A-Z0-9\-\.\/\+]{3,}[A-Z0-9]")  # loose alnum/dash run
 
 COMMON_NON_LABEL_WORDS = {
     "STEREO",
@@ -336,6 +339,45 @@ def _extract_catalog_from_text(lines: List[str]) -> Optional[str]:
     return f"{letters}-{digits}"
 
 
+def _extract_matrix_from_text(lines: List[str]) -> Optional[str]:
+    """
+    Very loose heuristic to grab a matrix/runout-like token from label OCR text.
+
+    Looks for alphanumeric/dash strings (5–14 chars) that contain both letters
+    and digits and are not obviously words. Prefers tokens with side markers
+    like A/B/1/2.
+    """
+    candidates: List[str] = []
+    side_bias = ("A", "B", "1", "2")
+
+    for line in lines:
+        for m in MATRIX_TOKEN.finditer(line.upper()):
+            token = m.group(0)
+            if len(token) < 5 or len(token) > 14:
+                continue
+            if not (re.search(r"[A-Z]", token) and re.search(r"\d", token)):
+                continue
+            # skip if looks like a plain catalog already caught
+            if re.match(r"^[A-Z]{2,5}\d{3,6}$", token.replace("-", "")):
+                continue
+            candidates.append(token)
+
+    if not candidates:
+        return None
+
+    # Prefer tokens with side hints
+    def score(tok: str) -> int:
+        s = 0
+        if any(ch in tok for ch in side_bias):
+            s += 1
+        if "-" in tok:
+            s += 1
+        return s
+
+    candidates.sort(key=lambda t: (score(t), len(t)), reverse=True)
+    return candidates[0]
+
+
 # ---------------------------------------------------------------------------
 # Extract structured fields
 # ---------------------------------------------------------------------------
@@ -344,6 +386,7 @@ def _extract_from_lines(lines: List[str]) -> Dict[str, Any]:
     """Given OCR text lines, extract structured fields."""
     # First, try to grab a catalog number from the whole text
     ocr_catalog: Optional[str] = _extract_catalog_from_text(lines)
+    ocr_matrix: Optional[str] = _extract_matrix_from_text(lines)
 
     ocr_label: Optional[str] = None
     ocr_year: Optional[str] = None
@@ -418,6 +461,7 @@ def _extract_from_lines(lines: List[str]) -> Dict[str, Any]:
 
     return {
         "Ocr_Catalog": ocr_catalog or "",
+        "Ocr_Matrix": ocr_matrix or "",
         "Ocr_Label": ocr_label or "",
         "Ocr_Year": ocr_year or "",
         "Ocr_StereoMono": stereo_mono or "",
@@ -471,8 +515,9 @@ def enrich_meta_with_label(
         enriched["Label_Catalog_Number"] = ocr_fields["Ocr_Catalog"]
 
     logging.info(
-        "Label OCR: catalog=%s label=%s year=%s conf=%s (image=%s)",
+        "Label OCR: catalog=%s matrix=%s label=%s year=%s conf=%s (image=%s)",
         ocr_fields.get("Ocr_Catalog") or "",
+        ocr_fields.get("Ocr_Matrix") or "",
         ocr_fields.get("Ocr_Label") or "",
         ocr_fields.get("Ocr_Year") or "",
         ocr_fields.get("Ocr_Scan_Confidence"),
@@ -519,6 +564,7 @@ def build_discogs_query_with_label(meta: Mapping[str, Any]) -> str:
     Build a Discogs search query string combining:
       - Artist / Title
       - Spreadsheet + OCR catalog/label
+      - OCR matrix (if present; used as a hint)
       - Stereo/Mono
       - Year (ALWAYS last in the query)
 
@@ -548,6 +594,11 @@ def build_discogs_query_with_label(meta: Mapping[str, Any]) -> str:
     label = lab_sheet or lab_ocr
     if label:
         parts.append(f"Lbl:{label}")
+
+    # Matrix hint (optional)
+    matrix = str(meta.get("Ocr_Matrix") or "").strip()
+    if matrix and len(matrix) >= 5:
+        parts.append(f"Mat:{matrix}")
 
     # Stereo / Mono
     stereo = str(meta.get("Ocr_StereoMono") or "").strip()

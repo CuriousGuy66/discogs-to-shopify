@@ -29,7 +29,7 @@ from datetime import datetime
 from typing import Optional
 
 
-def setup_logging(level: int = logging.DEBUG) -> str:
+def setup_logging(level: int = logging.DEBUG, log_root: Optional[str] = None) -> str:
     """
     Configure global logging, *replacing* any existing handlers.
 
@@ -43,7 +43,9 @@ def setup_logging(level: int = logging.DEBUG) -> str:
     for h in list(root_logger.handlers):
         root_logger.removeHandler(h)
 
-    log_root = os.path.expanduser("~/.discogs_to_shopify/logs")
+    if not log_root:
+        log_root = os.path.expanduser("~/.discogs_to_shopify/logs")
+
     os.makedirs(log_root, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

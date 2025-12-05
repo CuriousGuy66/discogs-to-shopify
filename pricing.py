@@ -135,6 +135,8 @@ class PricingContext:
 
     reference_price: Optional[float] = None
 
+    discogs_high: Optional[float] = None
+    discogs_suggested: Optional[float] = None
     discogs_median: Optional[float] = None
     discogs_last: Optional[float] = None
     discogs_low: Optional[float] = None
@@ -267,7 +269,15 @@ def compute_ebay_price(
 # DISCOGS FALLBACK
 # ====================================================================
 def discogs_fallback(ctx: PricingContext) -> Optional[PricingResult]:
-    if ctx.discogs_median:
+    if ctx.discogs_high:
+        price = ctx.discogs_high
+        code = "DHIG"
+        notes = "DHIG - Discogs high marketplace price"
+    elif ctx.discogs_suggested:
+        price = ctx.discogs_suggested
+        code = "DSUG"
+        notes = "DSUG - Discogs price suggestion (condition-based)"
+    elif ctx.discogs_median:
         price = ctx.discogs_median
         code = "DMED"
         notes = "DMED - Discogs median sold price"
@@ -311,6 +321,26 @@ def floor_result() -> PricingResult:
     return PricingResult(GLOBAL_PRICE_FLOOR, "FLR", "FLR - Price floor applied")
 
 
+def maybe_override_with_reference(res: PricingResult, ctx: PricingContext) -> PricingResult:
+    """
+    If a reference price exists and is higher than the current result, override with REF.
+    """
+    if ctx.reference_price is None:
+        return res
+
+    try:
+        ref_val = float(ctx.reference_price)
+    except (TypeError, ValueError):
+        return res
+
+    ref_val = round_quarter(ref_val)
+    ref_val = max(ref_val, GLOBAL_PRICE_FLOOR)
+
+    if ref_val > res.final_price:
+        return PricingResult(ref_val, "REF", "REF - Spreadsheet reference (overrides lower price)")
+    return res
+
+
 # ====================================================================
 # MAIN PRICING DECISION ENGINE
 # ====================================================================
@@ -318,21 +348,22 @@ def compute_price(ctx: PricingContext) -> PricingResult:
 
     sold_res = compute_ebay_price(ctx.ebay_sold, ctx.media_condition, "EB1", "EBC")
     if sold_res:
-        return sold_res
+        return maybe_override_with_reference(sold_res, ctx)
 
     active_res = compute_ebay_price(ctx.ebay_active, ctx.media_condition, "EBA", "EBA")
     if active_res:
-        return active_res
+        return maybe_override_with_reference(active_res, ctx)
 
     disc_res = discogs_fallback(ctx)
     if disc_res:
-        return disc_res
+        return maybe_override_with_reference(disc_res, ctx)
 
     ref_res = ref_or_comparable(ctx)
     if ref_res:
         return ref_res
 
-    return floor_result()
+    floor_res = floor_result()
+    return maybe_override_with_reference(floor_res, ctx)
 
 
 # ====================================================================

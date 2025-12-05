@@ -45,8 +45,8 @@ def _safe_get(
     path: str,
     token: str,
     params: Optional[Dict[str, Any]] = None,
-    max_retries: int = 3,
-    timeout: int = 20,
+    max_retries: int = 5,
+    timeout: int = 40,
 ) -> Optional[requests.Response]:
     """
     Perform a GET with retry and simple backoff.
@@ -57,6 +57,8 @@ def _safe_get(
     params = params or {}
 
     backoff = 1.0
+    base_delay = 0.5  # small delay between attempts to ease rate limits
+    time.sleep(base_delay)
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -72,7 +74,7 @@ def _safe_get(
             if attempt == max_retries:
                 return None
             time.sleep(backoff)
-            backoff *= 2
+            backoff = min(backoff * 2, 10.0)
             continue
 
         # Basic rate-limit handling
@@ -84,12 +86,12 @@ def _safe_get(
             pass
 
         if resp.status_code == 429:
-            # Rate limited – back off and retry
+            # Rate limited — back off and retry
             logger.warning("Discogs rate limit hit on %s (attempt %d/%d)", url, attempt, max_retries)
             if attempt == max_retries:
                 return None
-            time.sleep(backoff)
-            backoff *= 2
+            time.sleep(max(backoff, 3.0))
+            backoff = min(backoff * 2, 10.0)
             continue
 
         if 500 <= resp.status_code < 600:
@@ -104,7 +106,7 @@ def _safe_get(
             if attempt == max_retries:
                 return None
             time.sleep(backoff)
-            backoff *= 2
+            backoff = min(backoff * 2, 10.0)
             continue
 
         # For all other statuses, return the response (caller can check .ok)
@@ -204,4 +206,27 @@ def get_marketplace_stats(token: str, release_id: int) -> Optional[Dict[str, Any
         return resp.json()
     except Exception as e:
         logger.warning("Discogs stats JSON parse failed for %s: %s", release_id, e)
+        return None
+
+
+def get_price_suggestions(token: str, release_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Fetch /marketplace/price_suggestions/{release_id}.
+    Returns a dict keyed by condition name with {"value": float, "currency": "..."}.
+    """
+    resp = _safe_get(f"/marketplace/price_suggestions/{release_id}", token)
+    if resp is None or not resp.ok:
+        logger.warning(
+            "Discogs price suggestions fetch failed for %s (resp=%s)",
+            release_id,
+            getattr(resp, "status_code", None),
+        )
+        return None
+
+    try:
+        return resp.json()
+    except Exception as e:
+        logger.warning(
+            "Discogs price suggestions JSON parse failed for %s: %s", release_id, e
+        )
         return None
