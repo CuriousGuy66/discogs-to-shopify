@@ -118,6 +118,12 @@ import requests
 import pandas as pd
 from PIL import Image  # retained in case of future image handling
 from slugify import slugify
+from core.clients.musicbrainz import MusicBrainzClient
+from core.clients.discogs import DiscogsClient as CoreDiscogsClient
+from core.lookup import _pick_musicbrainz_match, _enrich_mb_match_with_discogs
+from core.clients.shopify import ShopifyClient
+from core.exporters.shopify_api_exporter import ShopifyAPIExporter
+from core.models import ShopifyDraft, ReleaseMatch, RecordInput
 
 # ================================================================
 # 3. Local Project Imports
@@ -156,6 +162,9 @@ SHOPIFY_VARIANT_REQUIRES_SHIPPING = "TRUE"
 SHOPIFY_VARIANT_TAXABLE = "TRUE"
 SHOPIFY_PRODUCT_STATUS = "active"
 SHOPIFY_PUBLISHED = "TRUE"
+HANDLE_SUFFIX = (
+    os.getenv("HANDLE_SUFFIX", (dt.date.today().strftime("%Y%m%d") + "a")).strip()
+)
 
 MIN_PRICE = 2.50  # USD minimum
 PRICE_STEP = 0.25  # round to nearest quarter
@@ -170,6 +179,9 @@ COL_CENTER_LABEL_PHOTO = "Center label photo"
 COL_MEDIA_COND = "Media Condition"
 COL_SLEEVE_COND = "Sleeve Condition"
 COL_TYPE = "Type"
+COL_MUSICBRAINZ_ALBUMID = "MUSICBRAINZ_ALBUMID"
+COL_MUSICBRAINZ_RELEASEGROUPID = "MUSICBRAINZ_RELEASEGROUPID"
+COL_YEAR = "Year"
 
 # Description footer HTML appended to every product description
 DESCRIPTION_FOOTER_HTML = (
@@ -247,6 +259,13 @@ def normalize_artist_the(name: str) -> str:
     return name_stripped
 
 
+def strip_trailing_paren(name: str) -> str:
+    """Remove trailing parenthetical disambiguators like '(2)' from artist names."""
+    if not name:
+        return ""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
+
+
 def slugify_handle(text: str) -> str:
     """
     Create a Shopify handle from text.
@@ -254,6 +273,20 @@ def slugify_handle(text: str) -> str:
     if not text:
         return ""
     return slugify(text, lowercase=True)
+
+
+def generate_sku(handle: str) -> str:
+    """
+    Generate a 10-character alphanumeric SKU from the handle.
+    Uses the first part of the handle and a short hash suffix for uniqueness.
+    """
+    import hashlib
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", handle or "").upper()
+    prefix = cleaned[:6]
+    h = hashlib.md5(handle.encode("utf-8")).hexdigest().upper()
+    suffix = h[:4]
+    sku = (prefix + suffix).ljust(10, "X")[:10]
+    return sku
 
 
 def round_price(value: float) -> float:
@@ -274,10 +307,11 @@ def build_format_description(release: Dict[str, Any]) -> str:
     parts: List[str] = []
     for f in formats:
         name = f.get("name", "")
-        desc = f.get("descriptions", [])
+        desc = f.get("descriptions") or []
         if name:
             parts.append(name)
-        parts.extend(desc)
+        if isinstance(desc, (list, tuple)):
+            parts.extend(desc)
     return ", ".join(parts)
 
 
@@ -554,6 +588,7 @@ def build_shop_artist(artist_name: str, release_details: Dict[str, Any]) -> str:
       - For apparent persons, flip to Last, First Middle.
       - For bands/groups, leave as-is (but still normalized 'The X' later if desired).
     """
+    artist_name = strip_trailing_paren(artist_name)
     composer = extract_composer(release_details)
     upper_artist = artist_name.upper()
     orchestra_words = ["ORCHESTRA", "PHILHARMONIC", "SYMPHONY", "CONDUCTOR"]
@@ -660,6 +695,33 @@ def build_discogs_headers(token: str) -> Dict[str, str]:
         "User-Agent": DISCOGS_USER_AGENT,
         "Authorization": f"Discogs token={token}",
     }
+
+
+def _normalize_label_for_mb(label: Optional[str]) -> Optional[str]:
+    """
+    Loosen label text for MusicBrainz search:
+    - drop parenthetical suffixes like "(4)"
+    - strip common trailing words (Records/Record/Corp/Co/Inc)
+    - collapse spaces
+    """
+    if not label:
+        return None
+    lbl = str(label)
+    lbl = re.sub(r"\s*\([^)]*\)", "", lbl)  # remove parentheticals
+    lbl = re.sub(r"\b(Records?|Corp|Co\.?|Inc\.?)\b", "", lbl, flags=re.IGNORECASE)
+    lbl = re.sub(r"\s+", " ", lbl).strip()
+    return lbl or None
+
+
+def _normalize_artist_for_mb(artist: str) -> str:
+    """
+    Remove Discogs-style parenthetical disambiguators (e.g., 'Artist (2)')
+    before sending to MusicBrainz.
+    """
+    if not artist:
+        return ""
+    a = re.sub(r"\s*\([^)]*\)", "", str(artist))
+    return re.sub(r"\s+", " ", a).strip()
 
 
 def rate_limit_sleep(resp: requests.Response) -> None:
@@ -828,7 +890,7 @@ def save_settings(settings: Dict[str, Any]) -> None:
 # App metadata and bootstrap (base dirs + logging)
 # ---------------------------------------------------------------------------
 DISCOGS_API_BASE = "https://api.discogs.com"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.5.0"
 DISCOGS_USER_AGENT = (
     f"UnusualFindsDiscogsToShopify/{APP_VERSION} +https://unusualfinds.com"
 )
@@ -892,6 +954,7 @@ def make_shopify_rows_for_record(
     release_details: Dict[str, Any],
     misprint_info: Optional[Dict[str, Any]],
     handle_registry: Dict[str, int],
+    match: Optional[ReleaseMatch] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], float, Optional[float]]:
     """
     Build one or more Shopify rows (main product + optional image-only row)
@@ -902,6 +965,7 @@ def make_shopify_rows_for_record(
     """
 
     artist_raw = str(input_row.get(COL_ARTIST, "")).strip()
+    artist_clean = strip_trailing_paren(artist_raw)
     title = str(input_row.get(COL_TITLE, "")).strip()
 
     # Reference price may come in as float/NaN from pandas; normalize to clean string
@@ -918,7 +982,7 @@ def make_shopify_rows_for_record(
     sleeve_cond = str(input_row.get(COL_SLEEVE_COND, "")).strip()
     center_label_photo = str(input_row.get(COL_CENTER_LABEL_PHOTO, "")).strip()
 
-    artist_display = normalize_artist_the(artist_raw)
+    artist_display = normalize_artist_the(artist_clean)
 
     label, year = extract_label_and_year(release_details)
     genre, styles = extract_genre_and_styles(release_details)
@@ -947,15 +1011,8 @@ def make_shopify_rows_for_record(
                 discogs_barcode = val
                 break
 
-    # Pull SKU from input if present
-    sku_raw = (
-        input_row.get("SKU")
-        or input_row.get("Sku")
-        or input_row.get("sku")
-        or input_row.get("Variant SKU")
-        or ""
-    )
-    sku = str(sku_raw).strip()
+    # Autogenerate SKU from handle (10-char alphanumeric); do not use barcode
+    # SKU will be set after handle is computed below.
 
     # Weight estimation
     grams = calculate_weight_grams_from_formats(release_details)
@@ -965,36 +1022,25 @@ def make_shopify_rows_for_record(
     seo_title = build_seo_title(full_title)
     seo_description = build_seo_description(artist_display, title, year, genre)
 
-    # --- Discogs marketplace stats for pricing (HIGH price) ---
+    # --- Discogs marketplace stats / price suggestions for pricing ---
     market_stats = release_details.get("_marketplace_stats") or {}
-    discogs_high_price: Optional[float] = None
-
-    highest_obj = market_stats.get("highest_price")
-
-    if isinstance(highest_obj, dict):
-        # Normal case: {"value": 45.0, "currency": "USD"}
-        val = highest_obj.get("value")
-        try:
-            discogs_high_price = float(val) if val is not None else None
-        except (TypeError, ValueError):
-            discogs_high_price = None
-    else:
-        # Fallback in case the API ever returns a bare number
-        try:
-            discogs_high_price = float(highest_obj) if highest_obj is not None else None
-        except (TypeError, ValueError):
-            discogs_high_price = None
-
-    logger.info("Discogs HIGH marketplace price: %s", discogs_high_price)
-
-    # --- Discogs price suggestions (condition-based) ---
     price_suggestions = release_details.get("_price_suggestions") or {}
-    discogs_suggested_price = discogs_price_from_suggestions(media_cond, price_suggestions)
-    logger.info(
-        "Discogs price suggestion (media=%s): %s",
-        media_cond,
-        discogs_suggested_price,
-    )
+
+    match_for_pricing = match
+    if match_for_pricing is None:
+        match_for_pricing = ReleaseMatch(
+            source="discogs",
+            release_id=str(discogs_release_id or ""),
+            title=title,
+            artist=artist_display,
+            year=str(year) if year else None,
+            url=discogs_url or None,
+            discogs_release_id=str(discogs_release_id) if discogs_release_id else None,
+            discogs_url=discogs_url or None,
+            discogs_marketplace_stats=market_stats or None,
+            discogs_price_suggestions=price_suggestions or None,
+            raw=release_details,
+        )
 
     # --- eBay SOLD and ACTIVE listings for pricing ---
     # Temporarily disabled due to eBay API token/scope issues.
@@ -1009,18 +1055,11 @@ def make_shopify_rows_for_record(
     )
 
     # Build pricing context
-    ctx = pricing.PricingContext(
-        format_type=format_desc or (str(input_row.get(COL_TYPE, "")).strip() or "LP"),
+    ctx = pricing.pricing_context_from_match(
+        match=match_for_pricing,
         media_condition=media_cond,
         reference_price=clean_price(price_str),
-        discogs_suggested=discogs_suggested_price,
-        discogs_high=discogs_high_price,
-        discogs_median=None,
-        discogs_last=None,
-        discogs_low=None,
-        comparable_price=None,
-        ebay_sold=ebay_sold_listings,
-        ebay_active=ebay_active_listings,
+        format_type=format_desc or (str(input_row.get(COL_TYPE, "")).strip() or "LP"),
     )
 
     # Compute price using the pricing engine
@@ -1031,12 +1070,17 @@ def make_shopify_rows_for_record(
 
     # Unique handle
     base_handle = slugify_handle(f"{artist_display} {title} {year}".strip())
+    if HANDLE_SUFFIX:
+        base_handle = f"{base_handle}-{slugify_handle(HANDLE_SUFFIX)}"
     if base_handle not in handle_registry:
         handle_registry[base_handle] = 1
         handle = base_handle
     else:
         handle_registry[base_handle] += 1
         handle = f"{base_handle}-{handle_registry[base_handle]}"
+
+    # Autogenerated SKU (10-char alphanumeric)
+    sku = generate_sku(handle)
 
     # ------------------------------------------------------------
     # Main cover image: prefer release details, fall back to search.
@@ -1116,14 +1160,10 @@ def make_shopify_rows_for_record(
     # Metafield values
     # -------------------------
     album_cover_condtion_value = sleeve_cond
-    album_condition_value = "Used"
-
-    cond_parts: List[str] = []
-    if media_cond:
-        cond_parts.append(f"Media: {media_cond}")
-    if sleeve_cond:
-        cond_parts.append(f"Sleeve: {sleeve_cond}")
-    condition_summary = "; ".join(cond_parts)
+    # Album condition should reflect the media condition from the sheet
+    album_condition_value = media_cond
+    # Condition metafield should be a simple flag; always "Used"
+    condition_summary = "Used"
 
     condition_description_value = (
         str(input_row.get("Condition Description", "") or "").strip()
@@ -1153,7 +1193,7 @@ def make_shopify_rows_for_record(
         "Variant Compare At Price": "",
         "Cost per item": "",
         "Variant SKU": sku,
-        "Variant Barcode": discogs_barcode or sku,
+        "Variant Barcode": discogs_barcode or "",
         "Variant Inventory Tracker": "shopify",
         "Variant Inventory Policy": "deny",
         "Variant Inventory Qty": 1,
@@ -1178,6 +1218,7 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
         "product.metafields.custom.shop_artist": shop_artist,
         "product.metafields.custom.inventory_date": inventory_date,
+        "product.metafields.custom.discogs_release_id": str(discogs_release_id or ""),
         # Misprint diagnostics
         "Label_Misprint_Suspected": "TRUE" if mis_suspected else "FALSE",
         "Label_Misprint_Reasons": mis_reasons,
@@ -1220,9 +1261,73 @@ def make_shopify_rows_for_record(
         "product.metafields.custom.uses_stock_photo": uses_stock_photo_value,
         "product.metafields.custom.shop_artist": shop_artist,
         "product.metafields.custom.inventory_date": inventory_date,
+        "product.metafields.custom.discogs_release_id": str(discogs_release_id or ""),
     }
 
     return rows, metafield_row, price, ref_price_val
+
+
+def row_to_shopify_draft(
+    row: Dict[str, Any],
+    image_urls: Optional[List[str]] = None,
+) -> ShopifyDraft:
+    """
+    Convert the primary product row dict into a ShopifyDraft for API export.
+    Note: only uses HTTP(S) image URLs; local file paths are ignored to avoid storage issues.
+    """
+    tags_str = str(row.get("Tags", "") or "")
+    tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+    images: List[str] = []
+    if image_urls is not None:
+        images = [u for u in image_urls if u]
+    else:
+        img_src = str(row.get("Image Src", "") or "").strip()
+        if img_src.lower().startswith(("http://", "https://")):
+            images.append(img_src)
+
+    metafield_keys = [
+        "product.metafields.custom.shop_signage",
+        "product.metafields.custom.album_cover_condtion",
+        "product.metafields.custom.album_condition",
+        "product.metafields.custom.condition",
+        "product.metafields.custom.condition_description",
+        "product.metafields.custom.uses_stock_photo",
+        "product.metafields.custom.shop_artist",
+        "product.metafields.custom.inventory_date",
+        "product.metafields.custom.discogs_release_id",
+    ]
+    metafields: Dict[str, str] = {}
+    for k in metafield_keys:
+        if k in row and row[k] != "":
+            short_key = k.split(".")[-1]
+            val = str(row[k])
+            # Clean shop_artist: drop trailing "(number)" tokens like "(5)"
+            if short_key == "shop_artist":
+                import re as _re  # local import to avoid top-level change
+                val = _re.sub(r"\s*\(\d+\)$", "", val).strip()
+            metafields[short_key] = val
+
+    try:
+        price_val = float(row.get("Variant Price") or 0.0)
+    except Exception:
+        price_val = 0.0
+
+    return ShopifyDraft(
+        handle=str(row.get("Handle", "") or "").strip(),
+        title=str(row.get("Title", "") or "").strip(),
+        body_html=str(row.get("Description", "") or "").strip(),
+        vendor=str(row.get("Vendor", "") or "").strip(),
+        product_type=str(row.get("Type", "") or "").strip(),
+        product_category=str(row.get("Product category", "") or "").strip(),
+        tags=tags,
+        price=price_val,
+        metafields=metafields,
+        images=images,
+        collections=[],
+        sku=str(row.get("Variant SKU", "") or "").strip(),
+        barcode=str(row.get("Variant Barcode", "") or "").strip(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1237,11 +1342,22 @@ def process_file(
     output_not_matched: Path,
     output_metafields: Path,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    shopify_mode: str = "csv",
+    shopify_exporter: Optional[ShopifyAPIExporter] = None,
+    shopify_duplicates_path: Optional[Path] = None,
+    shopify_errors_path: Optional[Path] = None,
+    precomputed_matches: Optional[Dict[int, ReleaseMatch]] = None,
 ) -> Dict[str, Any]:
     """
     Load the input CSV/XLSX, process each row, and write output CSVs.
     """
     logger.info("Loading input file: %s", input_path)
+    musicbrainz_client = MusicBrainzClient(
+        user_agent="discogs-to-shopify/1.0 (contact: neal@unusualfinds.net)",
+        prefer_ipv4=True,
+    )
+    core_discogs_client = CoreDiscogsClient(token=discogs_token)
+
     if input_path.suffix.lower() in [".xlsx", ".xls"]:
         df = pd.read_excel(input_path)
     else:
@@ -1257,25 +1373,36 @@ def process_file(
     retry_rows: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
     total_final_price = 0.0
     total_reference_price = 0.0
+    shopify_errors: List[Dict[str, str]] = []
+    musicbrainz_match_count = 0
 
     handle_registry: Dict[str, int] = {}
 
     def process_single_row(idx: int, row: Dict[str, Any], allow_retry: bool = True) -> None:
-        nonlocal total_final_price, total_reference_price
+        nonlocal total_final_price, total_reference_price, musicbrainz_match_count
         artist = str(row.get(COL_ARTIST, "")).strip()
         title = str(row.get(COL_TITLE, "")).strip()
         country = str(row.get(COL_COUNTRY, "")).strip() or None
         catalog = str(row.get(COL_CATALOG, "")).strip() or None
+        barcode = str(row.get("Variant Barcode", "") or "").strip() or None
 
-        year_raw = row.get(COL_TYPE, "")
+        # Use explicit Year column only (Type does not contain year).
+        year_raw = row.get(COL_YEAR, "")
         year_val: Optional[int] = None
         if year_raw:
-            m = re.search(r"\b(19[0-9]{2}|20[0-2][0-9])\b", str(year_raw))
-            if m:
-                try:
-                    year_val = int(m.group(1))
-                except ValueError:
-                    year_val = None
+            try:
+                year_val = int(str(year_raw)[:4])
+            except Exception:
+                m = re.search(r"\b(19[0-9]{2}|20[0-2][0-9])\b", str(year_raw))
+                if m:
+                    try:
+                        year_val = int(m.group(1))
+                    except ValueError:
+                        year_val = None
+
+        mbid_provided = str(row.get(COL_MUSICBRAINZ_ALBUMID, "") or "").strip()
+        rgid_provided = str(row.get(COL_MUSICBRAINZ_RELEASEGROUPID, "") or "").strip()
+        format_hint = str(row.get(COL_TYPE, "") or "").strip()
 
         if not artist or not title:
             unmatched_rows.append(
@@ -1316,9 +1443,7 @@ def process_file(
                 row[_key] = meta[_key]
 
         enriched_query = build_discogs_query_with_label(meta)
-        logger.info("Row %d: searching Discogs for %s", idx, enriched_query)
 
-        # Catalog numbers from sheet vs OCR
         catalog_sheet_raw = (meta.get("Catalog Number") or catalog) or None
         catalog_ocr_raw = (
             meta.get("Label_Catalog_Number")
@@ -1329,20 +1454,171 @@ def process_file(
         # Basic sanity cleanup: drop pure-year "catnos" like "1969"
         catalog_sheet = sanitize_catalog_for_search(catalog_sheet_raw)
         catalog_ocr = sanitize_catalog_for_search(catalog_ocr_raw)
+        mb_catalog = catalog_sheet or catalog_ocr or catalog
+        mb_label = _normalize_label_for_mb(meta.get("Label"))
+        mb_artist = _normalize_artist_for_mb(artist)
+
+        # Optional precomputed match (e.g., MusicBrainz hit carrying Discogs ID)
+        row_match: Optional[ReleaseMatch] = None
+        if precomputed_matches and idx in precomputed_matches:
+            row_match = precomputed_matches[idx]
+
+        # Provided MusicBrainz MBID shortcut (for testing/explicit mapping)
+        if not row_match and mbid_provided:
+            try:
+                row_match = ReleaseMatch(
+                    source="musicbrainz",
+                    release_id=mbid_provided,
+                    title="",
+                    artist="",
+                    year=None,
+                    url=f"https://musicbrainz.org/release/{mbid_provided}",
+                    discogs_release_id=None,
+                    discogs_url=None,
+                    discogs_marketplace_stats=None,
+                    discogs_price_suggestions=None,
+                    raw={"provided_mbid": mbid_provided},
+                )
+                row_match = _enrich_mb_match_with_discogs(row_match, musicbrainz_client, core_discogs_client)
+                logger.info(
+                    "Row %d: using provided MusicBrainz MBID=%s; Discogs rel=%s",
+                    idx,
+                    mbid_provided,
+                    row_match.discogs_release_id or "-",
+                )
+            except Exception as exc:
+                row_match = None
+                logger.warning("Row %d: MusicBrainz enrich via provided MBID failed: %s", idx, exc)
+
+        # Provided release-group MBID fallback
+        if not row_match and rgid_provided:
+            try:
+                rg_releases = musicbrainz_client.releases_for_group(rgid_provided, limit=25)
+                logger.info(
+                    "Row %d: MusicBrainz release-group rgid=%s -> %d releases",
+                    idx,
+                    rgid_provided,
+                    len(rg_releases),
+                )
+                record_input = RecordInput(
+                    artist=mb_artist,
+                    title=title,
+                    label=mb_label,
+                    catalog=mb_catalog,
+                    barcode=barcode,
+                    country=country,
+                    year=year_val,
+                    format_hint=format_hint,
+                )
+                mb_pick = _pick_musicbrainz_match(rg_releases, record_input)
+                if mb_pick:
+                    mb_pick = _enrich_mb_match_with_discogs(mb_pick, musicbrainz_client, core_discogs_client)
+                    row_match = mb_pick
+                    logger.info(
+                        "Row %d: MusicBrainz group pick id=%s title=%r artist=%r year=%r discogs_rel=%s url=%s",
+                        idx,
+                        mb_pick.release_id,
+                        mb_pick.title,
+                        mb_pick.artist,
+                        mb_pick.year,
+                        mb_pick.discogs_release_id or "-",
+                        mb_pick.url,
+                    )
+                else:
+                    logger.info("Row %d: MusicBrainz release-group had no suitable pick.", idx)
+            except Exception as exc:
+                logger.warning("Row %d: MusicBrainz release-group lookup failed: %s", idx, exc)
+
+        # MusicBrainz first pass for hints (label/catalog/barcode/country/year)
+        if not row_match:
+            try:
+                mb_results = musicbrainz_client.search_release(
+                    artist=mb_artist,
+                    title=title,
+                    catno=mb_catalog,
+                    barcode=barcode,
+                    label=mb_label,
+                    country=country,
+                    year=year_val,
+                    limit=5,
+                ) or []
+                logger.info(
+                    "Row %d: MusicBrainz search artist=%r title=%r label=%r cat=%r barcode=%r country=%r year=%r -> %d result(s)",
+                    idx,
+                    artist,
+                    title,
+                    mb_label or meta.get("Label"),
+                    mb_catalog,
+                    barcode,
+                    country,
+                    year_val,
+                    len(mb_results),
+                )
+                record_input = RecordInput(
+                    artist=mb_artist,
+                    title=title,
+                    label=mb_label,
+                    catalog=mb_catalog,
+                    barcode=barcode,
+                    country=country,
+                    year=year_val,
+                    format_hint=format_hint,
+                )
+                mb_pick = _pick_musicbrainz_match(mb_results, record_input)
+                if not mb_results:
+                    logger.info("Row %d: MusicBrainz returned 0 results; falling back to Discogs search.", idx)
+                elif mb_pick:
+                    mb_pick = _enrich_mb_match_with_discogs(mb_pick, musicbrainz_client, core_discogs_client)
+                    row_match = mb_pick
+                    logger.info(
+                        "Row %d: MusicBrainz picked id=%s title=%r artist=%r year=%r discogs_rel=%s url=%s",
+                        idx,
+                        mb_pick.release_id,
+                        mb_pick.title,
+                        mb_pick.artist,
+                        mb_pick.year,
+                        mb_pick.discogs_release_id or "-",
+                        mb_pick.url,
+                    )
+                else:
+                    logger.info(
+                        "Row %d: MusicBrainz returned %d result(s) but none matched hints; falling back to Discogs search.",
+                        idx,
+                        len(mb_results),
+                    )
+            except Exception as exc:
+                logger.warning("Row %d: MusicBrainz lookup failed: %s", idx, exc)
+
+        if row_match and row_match.discogs_release_id:
+            logger.info(
+                "Row %d: using precomputed match %s (source=%s) with Discogs release %s; skipping Discogs search.",
+                idx,
+                row_match.release_id,
+                row_match.source,
+                row_match.discogs_release_id,
+            )
+        else:
+            logger.info("Row %d: searching Discogs for %s", idx, enriched_query)
 
         # ------------------------------------------------------------------
         # FIRST ATTEMPT: *loose* search – artist + title (+ country).
         # Do NOT filter by catalog or year here; that over-constrains things
         # and can break cases where spreadsheet/OCR year or catalog are off.
         # ------------------------------------------------------------------
-        search_obj = discogs_search_release(
-            discogs_token,
-            artist,
-            title,
-            country,
-            None,   # no catalog filter
-            None,   # no year filter
-        )
+        release_id = None
+        search_obj: Dict[str, Any] = {}
+        if row_match and row_match.discogs_release_id:
+            release_id = row_match.discogs_release_id
+            search_obj = {"id": release_id, "title": row_match.title, "artist": row_match.artist}
+        else:
+            search_obj = discogs_search_release(
+                discogs_token,
+                artist,
+                title,
+                country,
+                None,   # no catalog filter
+                None,   # no year filter
+            )
 
         # ------------------------------------------------------------------
         # SECOND ATTEMPT: if no result and we DO have an OCR catalog,
@@ -1396,7 +1672,7 @@ def process_file(
                 progress_callback(idx, total_rows)
             return
 
-        release_id = search_obj.get("id")
+        release_id = release_id or search_obj.get("id")
         if not release_id:
             logger.warning(
                 "Search result for row %d has no release ID; skipping.", idx
@@ -1415,7 +1691,7 @@ def process_file(
         # brief pause to ease rate limits
         time.sleep(0.2)
 
-        details = discogs_get_release_details(discogs_token, release_id)
+        details = discogs_get_release_details(discogs_token, int(release_id))
         if not details:
             logger.warning(
                 "Could not fetch details for release %s (row %d).",
@@ -1436,13 +1712,23 @@ def process_file(
                 progress_callback(idx, total_rows)
             return
 
-        market_stats = discogs_get_marketplace_stats(discogs_token, release_id)
+        market_stats = None
+        price_suggestions = None
+
+        if row_match and row_match.discogs_marketplace_stats:
+            market_stats = row_match.discogs_marketplace_stats
+        else:
+            market_stats = discogs_get_marketplace_stats(discogs_token, int(release_id))
+
         if market_stats:
             details["_marketplace_stats"] = market_stats
 
-        price_suggestions = discogs_client.get_price_suggestions(
-            discogs_token, release_id
-        )
+        if row_match and row_match.discogs_price_suggestions:
+            price_suggestions = row_match.discogs_price_suggestions
+        else:
+            price_suggestions = discogs_client.get_price_suggestions(
+                discogs_token, int(release_id)
+            )
         if price_suggestions:
             details["_price_suggestions"] = price_suggestions
 
@@ -1450,15 +1736,66 @@ def process_file(
 
         logger.info("Matched row %d to Discogs release %s", idx, release_id)
 
+        # Build a ReleaseMatch to pass through pricing/export so Discogs stats/suggestions stay attached
+        release_match = row_match or ReleaseMatch(
+            source="discogs",
+            release_id=str(release_id),
+            title=str(details.get("title") or row.get(COL_TITLE, "")),
+            artist=str(details.get("artists", [{}])[0].get("name") if details.get("artists") else row.get(COL_ARTIST, "")),
+            year=str(details.get("year")) if details.get("year") is not None else None,
+            url=f"https://www.discogs.com/release/{release_id}",
+            discogs_release_id=str(release_id),
+            discogs_url=f"https://www.discogs.com/release/{release_id}",
+            discogs_marketplace_stats=market_stats or None,
+            discogs_price_suggestions=price_suggestions or None,
+            raw=details,
+        )
+
+        if release_match.source == "musicbrainz":
+            musicbrainz_match_count += 1
+
         shopify_rows, metafield_row, final_price_val, ref_price_val = make_shopify_rows_for_record(
             row,
             search_obj,
             details,
             misprint_info,
             handle_registry,
+            release_match,
         )
         matched_rows.extend(shopify_rows)
         metafield_rows.append(metafield_row)
+        # Build and send ShopifyDraft immediately in API modes
+        if shopify_mode in ("shopify", "both") and shopify_exporter:
+            try:
+                # Collect all HTTP(S) image URLs from primary + additional image rows
+                image_urls: List[str] = []
+                for r in shopify_rows:
+                    img_src = str(r.get("Image Src", "") or "").strip()
+                    if img_src.lower().startswith(("http://", "https://")):
+                        image_urls.append(img_src)
+                draft = row_to_shopify_draft(shopify_rows[0], image_urls=image_urls)
+                if draft.handle:
+                    shopify_exporter.write_product(draft)
+            except Exception as e:
+                logger.warning(
+                    "Shopify API create failed for handle %s: %s",
+                    getattr(shopify_rows[0], "Handle", row.get("Handle", "")),
+                    e,
+                )
+                shopify_errors.append(
+                    {
+                        "Handle": row.get("Handle", ""),
+                        "Title": row.get("Title", ""),
+                        "Reason": f"{e}",
+                    }
+                )
+                unmatched_rows.append(
+                    {
+                        "Reason": f"Shopify API create failed: {e}",
+                        "Handle": row.get("Handle", ""),
+                        "Title": row.get("Title", ""),
+                    }
+                )
         total_final_price += float(final_price_val or 0.0)
         if ref_price_val is not None:
             total_reference_price += float(ref_price_val)
@@ -1478,7 +1815,7 @@ def process_file(
             process_single_row(idx, row, allow_retry=False)
 
     # Write matched CSV (products)
-    if matched_rows:
+    if shopify_mode in ("csv", "both") and matched_rows:
         logger.info("Writing matched output CSV (products): %s", output_matched)
         with output_matched.open("w", newline="", encoding="utf-8") as f:
             fieldnames = sorted({k for r in matched_rows for k in r.keys()})
@@ -1486,7 +1823,7 @@ def process_file(
             writer.writeheader()
             for r in matched_rows:
                 writer.writerow(r)
-    else:
+    elif shopify_mode in ("csv", "both"):
         logger.info("No matched rows; not writing matched CSV.")
 
     # Write unmatched CSV
@@ -1501,6 +1838,41 @@ def process_file(
     else:
         logger.info("No unmatched rows; not writing unmatched CSV.")
 
+    # Shopify API export (duplicates/errors already captured during per-row writes)
+    duplicates: List[str] = []
+    if shopify_mode in ("shopify", "both") and shopify_exporter:
+        duplicates = getattr(shopify_exporter, "duplicates", [])
+        if shopify_duplicates_path and duplicates:
+            try:
+                logger.info("Writing duplicate handles file: %s", shopify_duplicates_path)
+                with shopify_duplicates_path.open("w", encoding="utf-8") as f:
+                    for d in duplicates:
+                        f.write(f"{d}\n")
+            except Exception as e:
+                logger.warning("Failed to write duplicates file: %s", e)
+        if shopify_errors_path and shopify_errors:
+            try:
+                logger.info("Writing Shopify errors file: %s", shopify_errors_path)
+                with shopify_errors_path.open("w", newline="", encoding="utf-8") as f:
+                    fieldnames = ["Handle", "Title", "Reason"]
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for r in shopify_errors:
+                        writer.writerow(r)
+            except Exception as e:
+                logger.warning("Failed to write Shopify errors file: %s", e)
+
+    # Write metafields CSV
+    if shopify_mode in ("csv", "both") and metafield_rows:
+        logger.info("Writing metafields output CSV: %s", output_metafields)
+        with output_metafields.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metafield_rows[0].keys()))
+            writer.writeheader()
+            for r in metafield_rows:
+                writer.writerow(r)
+    elif shopify_mode in ("csv", "both"):
+        logger.info("No metafield rows; not writing metafields CSV.")
+
     summary = {
         "total_rows": total_rows,
         "matched_count": len(metafield_rows),
@@ -1508,28 +1880,25 @@ def process_file(
         "total_final_price": round(total_final_price, 2),
         "total_reference_price": round(total_reference_price, 2),
         "price_diff": round(total_final_price - total_reference_price, 2),
+        "shopify_uploaded": len(getattr(shopify_exporter, "created_ids", [])) if shopify_exporter else 0,
+        "shopify_duplicates": len(duplicates) if shopify_mode in ("shopify", "both") else 0,
+        "shopify_errors": len(shopify_errors) if shopify_mode in ("shopify", "both") else 0,
+        "musicbrainz_matched_count": musicbrainz_match_count,
     }
     logger.info(
-        "Summary: total=%s matched=%s unmatched=%s final_sum=%.2f ref_sum=%.2f diff=%.2f",
+        "Summary: total=%s matched=%s unmatched=%s final_sum=%.2f ref_sum=%.2f diff=%.2f shopify_uploaded=%s shopify_duplicate_records=%s mb_matched=%s",
         summary["total_rows"],
         summary["matched_count"],
         summary["unmatched_count"],
         summary["total_final_price"],
         summary["total_reference_price"],
         summary["price_diff"],
+        summary.get("shopify_uploaded"),
+        summary.get("shopify_duplicates"),
+        summary.get("musicbrainz_matched_count"),
     )
 
     return summary
-    # Write metafields CSV
-    if metafield_rows:
-        logger.info("Writing metafields output CSV: %s", output_metafields)
-        with output_metafields.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(metafield_rows[0].keys()))
-            writer.writeheader()
-            for r in metafield_rows:
-                writer.writerow(r)
-    else:
-        logger.info("No metafield rows; not writing metafields CSV.")
 
 
 # ---------------------------------------------------------------------------
@@ -1574,12 +1943,22 @@ def run_gui() -> None:
                 return str(files[0])
         return ""
 
+    last_input_path = settings.get("last_input_path", "")
+    if last_input_path and not Path(last_input_path).exists():
+        last_input_path = ""
+
     input_path_var = tk.StringVar(
-        value=settings.get("last_input_path", "") or pick_first_input()
+        value=last_input_path or ""
     )
     token_var = tk.StringVar(
         value=settings.get("last_discogs_token", os.getenv("DISCOGS_TOKEN", ""))
     )
+    output_mode_var = tk.StringVar(value="csv")
+    shopify_domain_var = tk.StringVar(
+        value=os.getenv("SHOPIFY_STORE_DOMAIN", "a908bf-3.myshopify.com")
+    )
+    shopify_token_var = tk.StringVar(value=os.getenv("SHOPIFY_ADMIN_TOKEN", ""))
+    shopify_api_version_var = tk.StringVar(value=os.getenv("SHOPIFY_API_VERSION", "2025-01"))
 
     header = ttk.Frame(mainframe)
     header.grid(row=0, column=0, columnspan=3, sticky="WE", pady=(0, 8))
@@ -1671,16 +2050,38 @@ def run_gui() -> None:
         row=4, column=1, sticky="WE"
     )
 
+    ttk.Label(mainframe, text="Output mode:").grid(row=5, column=0, sticky="W")
+    mode_frame = ttk.Frame(mainframe)
+    mode_frame.grid(row=5, column=1, sticky="W")
+    ttk.Radiobutton(mode_frame, text="CSV", variable=output_mode_var, value="csv").grid(row=0, column=0, padx=2)
+    ttk.Radiobutton(mode_frame, text="Shopify", variable=output_mode_var, value="shopify").grid(row=0, column=1, padx=2)
+    ttk.Radiobutton(mode_frame, text="Both", variable=output_mode_var, value="both").grid(row=0, column=2, padx=2)
+
+    ttk.Label(mainframe, text="Shopify domain:").grid(row=6, column=0, sticky="W")
+    ttk.Entry(mainframe, width=40, textvariable=shopify_domain_var).grid(
+        row=6, column=1, sticky="WE"
+    )
+
+    ttk.Label(mainframe, text="Shopify token:").grid(row=7, column=0, sticky="W")
+    ttk.Entry(mainframe, width=40, textvariable=shopify_token_var, show="*").grid(
+        row=7, column=1, sticky="WE"
+    )
+
+    ttk.Label(mainframe, text="Shopify API version:").grid(row=8, column=0, sticky="W")
+    ttk.Entry(mainframe, width=20, textvariable=shopify_api_version_var).grid(
+        row=8, column=1, sticky="W"
+    )
+
     progress = ttk.Progressbar(
         mainframe, orient="horizontal", mode="determinate"
     )
-    progress.grid(row=5, column=0, columnspan=3, sticky="WE", pady=(8, 4))
+    progress.grid(row=9, column=0, columnspan=3, sticky="WE", pady=(8, 4))
 
     log_text = scrolledtext.ScrolledText(
         mainframe, width=80, height=20, state="disabled"
     )
-    log_text.grid(row=6, column=0, columnspan=3, sticky="NSEW")
-    mainframe.rowconfigure(6, weight=1)
+    log_text.grid(row=11, column=0, columnspan=3, sticky="NSEW")
+    mainframe.rowconfigure(11, weight=1)
 
     def clear_log_window() -> None:
         log_text.configure(state="normal")
@@ -1714,7 +2115,7 @@ def run_gui() -> None:
         open_path(DIRS["logs"])
 
     buttons_frame = ttk.Frame(mainframe)
-    buttons_frame.grid(row=8, column=0, columnspan=3, sticky="WE", pady=(6, 0))
+    buttons_frame.grid(row=12, column=0, columnspan=3, sticky="WE", pady=(6, 0))
     ttk.Button(buttons_frame, text="Open matched CSV", command=open_matched).grid(
         row=0, column=0, padx=4, sticky="W"
     )
@@ -1726,14 +2127,17 @@ def run_gui() -> None:
     )
 
     ttk.Label(mainframe, textvariable=output_msg_var).grid(
-        row=7, column=0, columnspan=3, sticky="W", pady=(4, 0)
+        row=10, column=0, columnspan=3, sticky="W", pady=(4, 0)
     )
+
+    start_button = None  # will be assigned after creation
 
     def start_processing() -> None:
         input_path_str = input_path_var.get().strip()
         token_str = token_var.get().strip()
 
         clear_log_window()
+        output_msg_var.set("")
 
         if not input_path_str:
             messagebox.showerror("Error", "Please select an input file.")
@@ -1748,6 +2152,62 @@ def run_gui() -> None:
                 "Error", f"Input file does not exist:\n{input_path}"
             )
             return
+
+        shopify_mode = output_mode_var.get()
+        shopify_client = None
+        shopify_exporter = None
+        shopify_duplicates_path: Optional[Path] = None
+        shopify_errors_path: Optional[Path] = None
+
+        if shopify_mode in ("shopify", "both"):
+            domain = shopify_domain_var.get().strip()
+            shop_token = shopify_token_var.get().strip()
+            api_version = shopify_api_version_var.get().strip() or "2025-01"
+            if not domain or not shop_token:
+                messagebox.showerror(
+                    "Error",
+                    "Shopify domain/token are required for Shopify output.\n"
+                    "Please fill them in or choose CSV mode.",
+                )
+                return
+            try:
+                # Quick auth check before processing
+                shop_info = ShopifyClient(
+                    store_domain=domain,
+                    access_token=shop_token,
+                    api_version=api_version,
+                )
+                # Test /shop.json
+                import requests as _requests
+                resp = _requests.get(
+                    f"https://{domain}/admin/api/{api_version}/shop.json",
+                    headers={
+                        "X-Shopify-Access-Token": shop_token,
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    messagebox.showerror(
+                        "Error",
+                        f"Shopify auth failed (HTTP {resp.status_code}). "
+                        "Check your domain/token and try again.",
+                    )
+                    return
+
+                shopify_client = ShopifyClient(
+                    store_domain=domain,
+                    access_token=shop_token,
+                    api_version=api_version,
+                )
+                shopify_exporter = ShopifyAPIExporter(
+                    client=shopify_client,
+                    publish=False,  # drafts only
+                    dry_run=False,
+                )
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to init Shopify client: {e}")
+                return
 
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1769,6 +2229,18 @@ def run_gui() -> None:
         output_metafields = DIRS["output"] / (
             input_path.stem + f"_Metafields for matched records_Completed_{ts}.csv"
         )
+        output_duplicates = DIRS["output"] / (
+            input_path.stem + f"_Shopify_duplicates_{ts}.csv"
+        )
+        output_shopify_errors = DIRS["output"] / (
+            input_path.stem + f"_Shopify_errors_{ts}.csv"
+        )
+        if shopify_mode in ("shopify", "both"):
+            shopify_duplicates_path = output_duplicates
+            shopify_errors_path = output_shopify_errors
+
+        if start_button:
+            start_button.state(["disabled"])
 
         logger.info("Input file: %s", input_path)
         logger.info("Matched products output: %s", output_matched)
@@ -1792,10 +2264,16 @@ def run_gui() -> None:
                 output_not_matched=output_not_matched,
                 output_metafields=output_metafields,
                 progress_callback=progress_cb,
+                shopify_mode=shopify_mode,
+                shopify_exporter=shopify_exporter,
+                shopify_duplicates_path=shopify_duplicates_path,
+                shopify_errors_path=shopify_errors_path,
             )
         except Exception as e:
             logger.exception("Error during processing: %s", e)
             messagebox.showerror("Error", f"An error occurred:\n{e}")
+            if start_button:
+                start_button.state(["!disabled"])
             return
 
         try:
@@ -1821,6 +2299,9 @@ def run_gui() -> None:
             f"final_sum=${summary['total_final_price']:.2f}, "
             f"ref_sum=${summary['total_reference_price']:.2f}, "
             f"diff=${summary['price_diff']:.2f}\n"
+            f"Shopify uploaded={summary.get('shopify_uploaded', 0)}, "
+            f"duplicates={summary.get('shopify_duplicates', 0)}, "
+            f"errors={summary.get('shopify_errors', 0)}\n"
             f"Logs: {DIRS['logs']}\n"
         )
         output_msg_var.set(msg)
@@ -1839,11 +2320,17 @@ def run_gui() -> None:
             f"  Unmatched: {summary['unmatched_count']}\n"
             f"  Final sum: ${summary['total_final_price']:.2f}\n"
             f"  Ref sum: ${summary['total_reference_price']:.2f}\n"
-            f"  Difference: ${summary['price_diff']:.2f}\n",
+            f"  Difference: ${summary['price_diff']:.2f}\n"
+            f"  Shopify uploaded: {summary.get('shopify_uploaded', 0)}\n"
+            f"  Shopify duplicates: {summary.get('shopify_duplicates', 0)}\n"
+            f"  Shopify errors: {summary.get('shopify_errors', 0)}\n",
         )
+        if start_button:
+            start_button.state(["!disabled"])
 
-    ttk.Button(mainframe, text="Start", command=start_processing).grid(
-        row=9, column=0, columnspan=3, pady=(8, 4)
+    start_button = ttk.Button(mainframe, text="Start", command=start_processing)
+    start_button.grid(
+        row=13, column=0, columnspan=3, pady=(8, 4)
     )
 
     root.mainloop()
@@ -1922,7 +2409,137 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(
         f"Summary: total={summary['total_rows']} matched={summary['matched_count']} "
         f"unmatched={summary['unmatched_count']} final_sum={summary['total_final_price']:.2f} "
-        f"ref_sum={summary['total_reference_price']:.2f} diff={summary['price_diff']:.2f}"
+        f"ref_sum={summary['total_reference_price']:.2f} diff={summary['price_diff']:.2f} "
+        f"mb_matched={summary.get('musicbrainz_matched_count', 0)}"
+    )
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """
+    CLI entry point (overrides earlier definition) with Shopify API options.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Default to GUI if no args or --gui present
+    if "--gui" in argv or not argv:
+        run_gui()
+        return 0
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Discogs → Shopify vinyl import"
+    )
+    parser.add_argument("input_file", help="Input inventory CSV or XLSX file")
+    parser.add_argument(
+        "--discogs-token",
+        help="Discogs API token (or set DISCOGS_TOKEN env var)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Output directory (default: directory of input file)",
+        default=None,
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=["csv", "shopify", "both"],
+        default="csv",
+        help="Where to send matched records: csv (default), shopify API, or both.",
+    )
+    parser.add_argument(
+        "--shopify-domain",
+        help="Shopify store domain (e.g., a908bf-3.myshopify.com) or set SHOPIFY_STORE_DOMAIN.",
+        default=os.getenv("SHOPIFY_STORE_DOMAIN", ""),
+    )
+    parser.add_argument(
+        "--shopify-token",
+        help="Shopify Admin API access token (shpat_...) or set SHOPIFY_ADMIN_TOKEN.",
+        default=os.getenv("SHOPIFY_ADMIN_TOKEN", ""),
+    )
+    parser.add_argument(
+        "--shopify-api-version",
+        help="Shopify Admin API version (default: 2025-01).",
+        default=os.getenv("SHOPIFY_API_VERSION", "2025-01"),
+    )
+    args = parser.parse_args(argv)
+
+    token = args.discogs_token or os.getenv("DISCOGS_TOKEN")
+    if not token:
+        print(
+            "Error: Discogs token not provided. "
+            "Use --discogs-token or set DISCOGS_TOKEN.",
+            file=sys.stderr,
+        )
+        return 1
+
+    input_path = Path(args.input_file)
+    if not input_path.exists():
+        print(
+            f"Error: input file does not exist: {input_path}",
+            file=sys.stderr,
+        )
+        return 1
+
+    out_dir = Path(args.output_dir) if args.output_dir else DIRS["output"]
+    output_matched = out_dir / (
+        input_path.stem + "_Output for matched records.csv"
+    )
+    output_not_matched = out_dir / (input_path.stem + "_Not_Matched.csv")
+    output_metafields = out_dir / (
+        input_path.stem + "_Metafields for matched records.csv"
+    )
+    output_duplicates = out_dir / (
+        input_path.stem + "_Shopify_duplicates.csv"
+    )
+
+    shopify_mode = args.output_mode
+    shopify_client = None
+    shopify_exporter = None
+    if shopify_mode in ("shopify", "both"):
+        domain = args.shopify_domain.strip()
+        shopify_token = args.shopify_token.strip()
+        if not domain or not shopify_token:
+            print(
+                "Error: Shopify domain/token required for Shopify output. "
+                "Use --shopify-domain and --shopify-token or set SHOPIFY_STORE_DOMAIN/SHOPIFY_ADMIN_TOKEN.",
+                file=sys.stderr,
+            )
+            return 1
+        shopify_client = ShopifyClient(
+            store_domain=domain,
+            access_token=shopify_token,
+            api_version=args.shopify_api_version,
+        )
+        shopify_exporter = ShopifyAPIExporter(
+            client=shopify_client,
+            publish=False,  # drafts only
+            dry_run=False,
+        )
+
+    print_run_banner()
+
+    summary = process_file(
+        input_path=input_path,
+        discogs_token=token,
+        output_matched=output_matched,
+        output_not_matched=output_not_matched,
+        output_metafields=output_metafields,
+        progress_callback=None,
+        shopify_mode=shopify_mode,
+        shopify_exporter=shopify_exporter,
+        shopify_duplicates_path=output_duplicates if shopify_mode in ("shopify", "both") else None,
+    )
+
+    print("Done.")
+    print(
+        f"Summary: total={summary['total_rows']} matched={summary['matched_count']} "
+        f"unmatched={summary['unmatched_count']} final_sum={summary['total_final_price']:.2f} "
+        f"ref_sum={summary['total_reference_price']:.2f} diff={summary['price_diff']:.2f} "
+        f"shopify_created={summary.get('shopify_created', 0)} "
+        f"shopify_duplicates={summary.get('shopify_duplicates', 0)} "
+        f"mb_matched={summary.get('musicbrainz_matched_count', 0)}"
     )
     return 0
 

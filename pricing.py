@@ -44,6 +44,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from statistics import median
+from typing import Any as _Any  # avoid circulars for helper signatures
+
+# Optional typing for upstream matches without hard dependency.
+try:
+    from core.models import ReleaseMatch  # type: ignore
+except Exception:  # pragma: no cover
+    ReleaseMatch = _Any  # type: ignore
 
 
 # ====================================================================
@@ -377,3 +384,76 @@ def enrich_row_with_pricing(row: Dict[str, Any], ctx: PricingContext) -> Dict[st
     row["Pricing Notes"] = res.notes
 
     return row
+
+
+# ====================================================================
+# MATCH-DRIVEN PRICING HELPERS (e.g., MusicBrainz hit with Discogs url-rel)
+# ====================================================================
+def _extract_price_value(stats: Optional[dict], key: str) -> Optional[float]:
+    if not stats or key not in stats:
+        return None
+    val = stats.get(key)
+    if isinstance(val, dict):
+        try:
+            if val.get("value") is not None:
+                return float(val["value"])
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def pricing_context_from_match(
+    match: _Any,
+    media_condition: Optional[str],
+    reference_price: Optional[float],
+    format_type: str = "LP",
+) -> PricingContext:
+    """
+    Build a PricingContext using any Discogs stats/suggestions already attached
+    to a ReleaseMatch (e.g., from a MusicBrainz url-rel), avoiding a new Discogs lookup.
+    """
+    stats = getattr(match, "discogs_marketplace_stats", None) or {}
+    suggestions = getattr(match, "discogs_price_suggestions", None) or {}
+
+    discogs_high = _extract_price_value(stats, "highest_price")
+    discogs_median = _extract_price_value(stats, "median")
+    discogs_last = _extract_price_value(stats, "last")
+    discogs_low = _extract_price_value(stats, "lowest_price")
+
+    discogs_suggested = None
+    if suggestions:
+        try:
+            discogs_suggested = discogs_price_from_suggestions(media_condition or "", suggestions)
+        except Exception:
+            discogs_suggested = None
+
+    return PricingContext(
+        format_type=format_type,
+        media_condition=media_condition,
+        reference_price=reference_price,
+        discogs_high=discogs_high,
+        discogs_suggested=discogs_suggested,
+        discogs_median=discogs_median,
+        discogs_last=discogs_last,
+        discogs_low=discogs_low,
+        comparable_price=None,
+        ebay_sold=[],
+        ebay_active=[],
+    )
+
+
+def compute_price_from_match(
+    match: _Any,
+    media_condition: Optional[str],
+    reference_price: Optional[float],
+    format_type: str = "LP",
+) -> PricingResult:
+    """
+    Convenience wrapper: build a PricingContext from a match carrying Discogs
+    stats/suggestions (e.g., MusicBrainz hit with Discogs url-rel) and compute price.
+    """
+    ctx = pricing_context_from_match(match, media_condition, reference_price, format_type)
+    return compute_price(ctx)

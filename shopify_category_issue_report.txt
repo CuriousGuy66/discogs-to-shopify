@@ -1,0 +1,72 @@
+Subject: Product category ignored in Admin API (2025-01) for category gid://shopify/TaxonomyCategory/me-3-6
+
+Store: a908bf-3.myshopify.com
+API version: 2025-01
+Endpoints tested: REST POST /admin/api/2025-01/products.json and PUT /admin/api/2025-01/products/{id}.json
+
+Issue:
+- On create, I send the new category field with the Vinyl category GID and standardized product type, but the response shows category=null, product_category=null, standardized_product_type=null.
+- A follow-up REST PUT to set the category also returns 200 but leaves those fields null.
+- GraphQL productCategoryUpdate mutation/ProductCategoryUpdateInput do not exist in my schema for 2025-01 (undefined field/type errors).
+
+Sample payloads:
+
+POST /products.json
+{
+  "product": {
+    "title": "Mary Jayne Gaetke – My Wonderful Lord (1976, Sacred (7))",
+    "handle": "mary-jayne-gaetke-my-wonderful-lord-1976",
+    "status": "draft",
+    "category": "gid://shopify/TaxonomyCategory/me-3-6",
+    "standardized_product_type": "Vinyl in Music & Sound Recordings",
+    "images": [{"src": "https://…/image.webp"}],
+    "variants": [{
+      "price": "6.50",
+      "inventory_management": "shopify",
+      "inventory_policy": "deny",
+      "inventory_quantity": 1,
+      "requires_shipping": true
+    }]
+  }
+}
+
+Response (201):
+{
+  "product": {
+    "id": 9291279794484,
+    "category": null,
+    "product_category": null,
+    "standardized_product_type": null,
+    "images": []
+  }
+}
+
+PUT /products/9291279794484.json
+{
+  "product": {
+    "id": 9291279794484,
+    "category": "gid://shopify/TaxonomyCategory/me-3-6",
+    "standardized_product_type": "Vinyl in Music & Sound Recordings",
+    "standard_product_type": "Vinyl in Music & Sound Recordings",
+    "product_category": {"product_taxonomy_node_id": "gid://shopify/ProductTaxonomyNode/543525"}
+  }
+}
+
+Response (200):
+{
+  "product": {
+    "id": 9291279794484,
+    "category": null,
+    "product_category": null,
+    "standardized_product_type": null
+  }
+}
+
+GraphQL:
+- productCategoryUpdate mutation is missing; ProductCategoryUpdateInput is undefined in the schema for 2025-01.
+
+Expected:
+- Category should be stored when sending the new category GID.
+- A supported mutation or REST update should allow setting the category if not set on create.
+
+Please advise why the category is being dropped and how to set the category in 2025-01 given the schema and REST behavior above.

@@ -73,7 +73,7 @@ logging.warning(
     URL_DOWNLOAD_ENABLED,
 )
 # Manual runtime switch so we can turn label OCR on/off easily
-LABEL_OCR_ENABLED = False  # <-- set to True when you're ready to re-enable
+LABEL_OCR_ENABLED = False  # default OFF; flip to True to enable OCR processing
 
 # ---------------------------------------------------------------------------
 # Patterns / constants
@@ -108,6 +108,35 @@ COMMON_NON_LABEL_WORDS = {
     "TRADE",
     "MARK",
 }
+
+
+def _clean_ocr_text(value: str, allow_newlines: bool = False) -> str:
+    """
+    Normalize OCR text:
+    - Unicode NFKD -> ASCII
+    - Strip control chars
+    - Whitelist basic punctuation (.,:;'\"&()/\\-)
+    - Collapse whitespace and trim common junk
+    """
+    if value is None:
+        return ""
+
+    def _clean_line(line: str) -> str:
+        text = unicodedata.normalize("NFKD", str(line or ""))
+        text = text.encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^A-Za-z0-9\\s\\.,:;'\"&()\\/\\-]+", " ", text)
+        text = re.sub(r"\\s+", " ", text).strip(" -/.,;:'\"")
+        return text
+
+    if allow_newlines:
+        parts = []
+        for ln in str(value).splitlines():
+            cleaned = _clean_line(ln)
+            if cleaned:
+                parts.append(cleaned)
+        return "\\n".join(parts)
+
+    return _clean_line(str(value))
 
 # ---------------------------------------------------------------------------
 # File / URL helpers
@@ -225,6 +254,10 @@ def _resolve_image_path(image_path: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _run_ocr(image_path: str) -> List[str]:
+    if not LABEL_OCR_ENABLED:
+        logging.info("Label OCR disabled; skipping OCR for %s", image_path)
+        return []
+
     """
     Run OCR on the center label image and return a list of text lines.
 
@@ -459,7 +492,7 @@ def _extract_from_lines(lines: List[str]) -> Dict[str, Any]:
     if score > 1.0:
         score = 1.0
 
-    return {
+    raw_fields = {
         "Ocr_Catalog": ocr_catalog or "",
         "Ocr_Matrix": ocr_matrix or "",
         "Ocr_Label": ocr_label or "",
@@ -470,6 +503,25 @@ def _extract_from_lines(lines: List[str]) -> Dict[str, Any]:
         "Ocr_Notes": "\n".join(notes) if notes else "",
         "Ocr_Scan_Confidence": round(score, 3),
     }
+
+    cleaned_fields: Dict[str, Any] = {}
+    for key, val in raw_fields.items():
+        if key in ("Ocr_Tracks", "Ocr_Notes"):
+            cleaned_fields[key] = _clean_ocr_text(val, allow_newlines=True)
+        else:
+            cleaned_fields[key] = _clean_ocr_text(val)
+
+    # Keep confidence as numeric
+    cleaned_fields["Ocr_Scan_Confidence"] = raw_fields["Ocr_Scan_Confidence"]
+
+    # Preserve raw alongside cleaned for debugging
+    raw_with_suffix = {f"{k}_Raw": v for k, v in raw_fields.items()}
+
+    combined = {}
+    combined.update(raw_with_suffix)
+    combined.update(cleaned_fields)
+
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +539,10 @@ def enrich_meta_with_label(
     meta: dict with keys like Artist, Title, Catalog Number, Label, Country, Year.
     row:  full input row (used to locate the label image path).
     """
+    if not LABEL_OCR_ENABLED:
+        logging.info("Label OCR disabled via LABEL_OCR_ENABLED; skipping.")
+        return meta
+
     image_path = str(row.get(label_image_column, "")).strip()
     logging.info("Label OCR: row image_path=%r", image_path)
 

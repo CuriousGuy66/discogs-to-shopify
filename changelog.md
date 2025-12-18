@@ -1,4 +1,4 @@
-# Discogs to Shopify – Changelog
+# Discogs to Shopify Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -10,7 +10,16 @@ The format is:
 
 ---
 
-## v1.3.0 � 2025-12-04
+## v1.5.0 - 2025-12-12
+
+- Shopify taxonomy: default category GID set to Records & LPs (`gid://shopify/TaxonomyCategory/me-3-4`) and added a post-create GraphQL category update for reliable taxonomy on 2025-01+.
+- Shipping profile tooling: added `scripts/data_repair/assign_shipping_profile.py` with README guidance; defaults product_type to "Vinyl Record" and warns on mismatches.
+- Shipping packages: added API helpers under `API Testing/` (`assign_shipping_package.py`, `query_variant_delivery_profile.py`, `get_shipping_packages.py`) to inspect delivery profiles and set packages; package write depends on Shopify exposing `shippingPackageId` per store.
+- Resilience/logging: exporter now warns/defaults missing product_type and uses GraphQL category update after REST create.
+
+---
+
+## v1.3.0 - 2025-12-04
 
 - GUI/paths: default base folder under Documents/UnusualFindsAlbumApp with fixed input/output/logs/cache, timestamped outputs, processed input moves to `input/processed/`, quick-open buttons, and settings gear to change the base.
 - Metafields: added `product.metafields.custom.inventory_date` normalized to YYYY-MM-DD.
@@ -20,10 +29,10 @@ The format is:
 
 ---
 
-## v1.0.0 – 2025-11-23
+## v1.0.0 - 2025-11-23
 
 - Created the first tracked version of `discogs_to_shopify.py`.
-- Implemented Discogs → Shopify pipeline (no GUI).
+- Implemented Discogs + Shopify pipeline (no GUI).
 - Input:
   - Reads CSV/XLSX.
   - Uses the following key columns:
@@ -46,14 +55,14 @@ The format is:
   - Rounds to the nearest $0.25.
   - Enforces minimum price of $2.50.
 - Artist normalization:
-  - If artist starts with `"The "`, moves it to the end:
-    - `"The Beatles"` → `"Beatles, The"`.
+  - If artist starts with "The ", moves it to the end:
+    - "The Beatles" -> "Beatles, The".
 - Weight:
   - Estimates weight in grams from the number of discs:
-    - 1 disc → 300 g
-    - 2 discs → 500 g
-    - 3 discs → 700 g
-    - 4+ discs → 300 g + 200 g per extra disc
+    - 1 disc -> 300 g
+    - 2 discs -> 500 g
+    - 3 discs -> 700 g
+    - 4+ discs -> 300 g + 200 g per extra disc
   - Converts grams to pounds for a helper column.
 - Shopify CSV mapping:
   - Fields aligned with `product_template_csv_unit_price.csv`, including:
@@ -121,5 +130,5 @@ The format is:
 - Metafields:
   - Writes the following product metafields:
     - `Metafield: custom.album_cover_condition [single_line_text_field]`
-    - `Metafield: custom.album_condition [single_line_text_field]` = `"Used"`
+    - `Metafield: custom.album_condition [single_line_text_field]` = "Used"
     - `Metafield: custom.shop_signage [single_line_text_field]` = signage bucket.

@@ -60,3 +60,7 @@ README.md
 - Commit
 - Push
 - Tag & Release
+
+## Notes
+- Shopify integration implemented; category (taxonomy) now set via REST + post-create GraphQL update with default GID for Records & LPs.
+- Shipping package assignment remains limited by Shopify API exposure of `shippingPackageId`; package helper provided, but field availability may vary per store/version.
